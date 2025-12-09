@@ -1,0 +1,3475 @@
+# Autonomous Agent Implementation Plan
+## Skills + Tools Architecture
+
+This implementation plan covers building a general-purpose agent that supports **two distinct capability primitives**:
+
+1. **Tools**: Direct function calls via JSON Schema (LLM invokes them directly)
+2. **Skills**: Knowledge modules (SKILL.md + scripts) that the agent reads and executes via command runner
+
+---
+
+## Table of Contents
+
+1. [Architecture Overview](#1-architecture-overview)
+2. [Key Concepts: Tools vs Skills](#2-key-concepts-tools-vs-skills)
+3. [File Structure](#3-file-structure)
+4. [Configuration System](#4-configuration-system)
+5. [LLM Abstraction Layer](#5-llm-abstraction-layer)
+6. [Tool System Implementation](#6-tool-system-implementation)
+7. [Skill System Implementation](#7-skill-system-implementation)
+8. [Core Agent with ReAct Loop](#8-core-agent-with-react-loop)
+9. [Fault Tolerance](#9-fault-tolerance)
+10. [WebSocket Transport Layer](#10-websocket-transport-layer)
+11. [System Prompt Design](#11-system-prompt-design)
+12. [Step-by-Step Implementation Order](#12-step-by-step-implementation-order)
+13. [Testing Strategy](#13-testing-strategy)
+
+---
+
+## 1. Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              CLIENT (WebSocket)                                  │
+└─────────────────────────────────────┬───────────────────────────────────────────┘
+                                      │ JSON Messages (streaming)
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          TRANSPORT LAYER (FastAPI)                               │
+│   • WebSocket endpoint with connection management                               │
+│   • Message validation (Pydantic)                                               │
+│   • Heartbeat/ping-pong for connection health                                   │
+└─────────────────────────────────────┬───────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           AGENT CORE (ReAct Loop)                                │
+│   • Conversation memory management                                              │
+│   • Decides: use Tool, read Skill, or respond directly                          │
+│   • Orchestrates multi-step execution                                           │
+│   • Error recovery and graceful degradation                                     │
+└────────────────┬─────────────────────────────────────┬──────────────────────────┘
+                 │                                     │
+        ┌────────▼────────┐                   ┌────────▼────────┐
+        │   TOOL SYSTEM   │                   │  SKILL SYSTEM   │
+        │                 │                   │                 │
+        │ • Tool Registry │                   │ • Skill Index   │
+        │ • JSON Schema   │                   │ • SKILL.md Docs │
+        │ • Direct Invoke │                   │ • Script Exec   │
+        │ • Parallel Exec │                   │ • Cmd Runner    │
+        └────────┬────────┘                   └────────┬────────┘
+                 │                                     │
+                 └──────────────┬──────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         LLM ABSTRACTION LAYER                                    │
+│   • Provider adapters (Claude, OpenAI, etc.)                                    │
+│   • Streaming support                                                           │
+│   • Prompt caching                                                              │
+│   • Response normalization                                                      │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow for Tool Calls
+```
+User Message → Agent → LLM decides tool_use → Tool Executor → Result → LLM → Response
+```
+
+### Data Flow for Skill Execution
+```
+User Message → Agent → LLM decides to read skill → read_skill tool → 
+LLM reads SKILL.md → LLM decides to execute_command → run_command tool → 
+Result → LLM → Response
+```
+
+---
+
+## 2. Key Concepts: Tools vs Skills
+
+### Tools (Direct Invocation)
+
+Tools are **function schemas** that the LLM can call directly. They're defined with JSON Schema and executed immediately when the LLM outputs a `tool_use` block.
+
+**Characteristics:**
+- Defined as Python functions with type hints
+- Auto-converted to JSON Schema for LLM
+- Executed in-process or via subprocess
+- Fast, single-step invocation
+- LLM knows exactly what parameters to pass
+
+**Example Tool:**
+```python
+@tool(name="get_weather", description="Get current weather for a location")
+def get_weather(location: str, units: str = "celsius") -> dict:
+    # Direct implementation
+    return {"temp": 22, "condition": "sunny"}
+```
+
+### Skills (Knowledge + Command Execution)
+
+Skills are **capability modules** consisting of:
+1. `SKILL.md` - Documentation with frontmatter (name, description) and usage instructions
+2. `scripts/` - Executable scripts the agent runs via command line
+
+**Characteristics:**
+- Agent must READ the skill documentation first
+- Agent then uses a generic `execute_command` tool to run skill scripts
+- Multi-step: read → understand → execute → interpret results
+- More flexible, can encode complex multi-command workflows
+- Self-documenting with examples in markdown
+
+**Example Skill Structure:**
+```
+skills/
+└── calculator/
+    ├── SKILL.md          # Frontmatter + documentation
+    └── scripts/
+        └── calc.py       # Executable script
+```
+
+**Skill Discovery Flow:**
+1. Agent receives task: "Calculate 15% of 200"
+2. System prompt tells agent about available skills
+3. Agent calls `read_skill("calculator")` tool
+4. Agent reads SKILL.md, learns the command format
+5. Agent calls `execute_command("python3 skills/calculator/scripts/calc.py percent of 200 --percent 15")`
+6. Agent interprets JSON result, responds to user
+
+### Why Both?
+
+| Aspect | Tools | Skills |
+|--------|-------|--------|
+| Latency | Faster (single call) | Slower (read + execute) |
+| Flexibility | Fixed schema | Rich documentation |
+| Discoverability | LLM sees all schemas | Agent reads on-demand |
+| External Scripts | Requires wrapper | Native support |
+| Complex Workflows | Multiple tools | Single skill with examples |
+
+**Use Tools when:** Speed matters, simple operations, well-defined inputs
+**Use Skills when:** Complex operations, external scripts, self-documented workflows
+
+---
+
+## 3. File Structure
+
+```
+autonomous-agent/
+├── pyproject.toml                    # Dependencies and project config
+├── config/
+│   ├── config.yaml                   # Main configuration
+│   └── prompts/
+│       └── system_prompt.txt         # System prompt template
+│
+├── skills/                           # Skill modules directory
+│   └── calculator/                   # Example skill
+│       ├── SKILL.md
+│       └── scripts/
+│           └── calc.py
+│
+├── src/
+│   └── agent/
+│       ├── __init__.py
+│       ├── main.py                   # Application entrypoint
+│       │
+│       ├── transport/                # WebSocket layer
+│       │   ├── __init__.py
+│       │   ├── server.py             # FastAPI app + WebSocket endpoint
+│       │   ├── connection.py         # Connection manager with heartbeat
+│       │   └── messages.py           # Pydantic message schemas
+│       │
+│       ├── core/                     # Agent logic
+│       │   ├── __init__.py
+│       │   ├── agent.py              # Main ReAct agent
+│       │   ├── memory.py             # Conversation context management
+│       │   └── planner.py            # Task planning (optional enhancement)
+│       │
+│       ├── tools/                    # Tool system
+│       │   ├── __init__.py
+│       │   ├── registry.py           # Tool registration and discovery
+│       │   ├── executor.py           # Tool execution engine
+│       │   ├── schema.py             # JSON Schema generation
+│       │   └── builtin/              # Built-in tools
+│       │       ├── __init__.py
+│       │       └── core_tools.py     # read_skill, execute_command, etc.
+│       │
+│       ├── skills/                   # Skill system
+│       │   ├── __init__.py
+│       │   ├── index.py              # Skill discovery and indexing
+│       │   ├── loader.py             # SKILL.md parser
+│       │   └── executor.py           # Command execution for skills
+│       │
+│       ├── llm/                      # LLM abstraction
+│       │   ├── __init__.py
+│       │   ├── base.py               # Abstract LLM interface
+│       │   ├── anthropic.py          # Claude adapter
+│       │   ├── openai.py             # OpenAI adapter (optional)
+│       │   └── factory.py            # Provider factory
+│       │
+│       ├── resilience/               # Fault tolerance
+│       │   ├── __init__.py
+│       │   ├── circuit_breaker.py
+│       │   ├── retry.py
+│       │   └── errors.py
+│       │
+│       └── config/                   # Configuration
+│           ├── __init__.py
+│           └── settings.py           # Pydantic settings
+│
+└── tests/
+    ├── test_agent.py
+    ├── test_tools.py
+    ├── test_skills.py
+    └── test_integration.py
+```
+
+---
+
+## 4. Configuration System
+
+### 4.1 Dependencies (pyproject.toml)
+
+```toml
+[project]
+name = "autonomous-agent"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "websockets>=13.0",
+    "anthropic>=0.40.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "tenacity>=9.0.0",
+    "pyyaml>=6.0.2",
+    "python-dotenv>=1.0.1",
+    "python-frontmatter>=1.1.0",  # For parsing SKILL.md frontmatter
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "httpx", "ruff"]
+openai = ["openai>=1.55.0"]
+
+[project.scripts]
+agent = "agent.main:main"
+```
+
+### 4.2 Configuration File (config/config.yaml)
+
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 8000
+  heartbeat_interval: 30
+  connection_timeout: 300
+
+llm:
+  provider: "anthropic"           # anthropic | openai
+  model: "claude-sonnet-4-5-20250929"
+  max_tokens: 4096
+  temperature: 0.7
+  
+  # Prompt caching (reduces latency by ~85% for cached portions)
+  cache:
+    enabled: true
+    cache_system_prompt: true
+
+agent:
+  max_iterations: 15              # Max ReAct loop iterations
+  max_tool_retries: 3             # Retries per tool failure
+  tool_timeout: 30                # Seconds before tool timeout
+  
+  # Circuit breaker for fault tolerance
+  circuit_breaker:
+    failure_threshold: 5
+    recovery_timeout: 60
+
+# Skill system configuration
+skills:
+  base_path: "./skills"           # Where skills are located
+  auto_discover: true             # Scan for skills on startup
+  allowed_commands:               # Security: allowed command prefixes
+    - "python3"
+    - "python"
+    - "node"
+    - "bash"
+  command_timeout: 60             # Max execution time for skill commands
+  sandbox: false                  # Future: run in sandbox
+
+# Tool system configuration  
+tools:
+  builtin_enabled: true           # Enable built-in tools
+  external_path: null             # Path to external tool plugins
+```
+
+### 4.3 Settings Module (src/agent/config/settings.py)
+
+```python
+from pydantic_settings import BaseSettings
+from pydantic import Field
+from typing import Optional, List
+from pathlib import Path
+import yaml
+import os
+
+
+class ServerConfig(BaseSettings):
+    host: str = "0.0.0.0"
+    port: int = 8000
+    heartbeat_interval: int = 30
+    connection_timeout: int = 300
+
+
+class LLMCacheConfig(BaseSettings):
+    enabled: bool = True
+    cache_system_prompt: bool = True
+
+
+class LLMConfig(BaseSettings):
+    provider: str = "anthropic"
+    model: str = "claude-sonnet-4-5-20250929"
+    max_tokens: int = 4096
+    temperature: float = 0.7
+    cache: LLMCacheConfig = LLMCacheConfig()
+    
+    # API keys from environment
+    anthropic_api_key: Optional[str] = Field(default=None, alias="ANTHROPIC_API_KEY")
+    openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
+
+
+class CircuitBreakerConfig(BaseSettings):
+    failure_threshold: int = 5
+    recovery_timeout: int = 60
+
+
+class AgentConfig(BaseSettings):
+    max_iterations: int = 15
+    max_tool_retries: int = 3
+    tool_timeout: float = 30.0
+    circuit_breaker: CircuitBreakerConfig = CircuitBreakerConfig()
+
+
+class SkillsConfig(BaseSettings):
+    base_path: str = "./skills"
+    auto_discover: bool = True
+    allowed_commands: List[str] = ["python3", "python", "node", "bash"]
+    command_timeout: int = 60
+    sandbox: bool = False
+
+
+class ToolsConfig(BaseSettings):
+    builtin_enabled: bool = True
+    external_path: Optional[str] = None
+
+
+class Settings(BaseSettings):
+    server: ServerConfig = ServerConfig()
+    llm: LLMConfig = LLMConfig()
+    agent: AgentConfig = AgentConfig()
+    skills: SkillsConfig = SkillsConfig()
+    tools: ToolsConfig = ToolsConfig()
+    
+    @classmethod
+    def from_yaml(cls, path: str = "config/config.yaml") -> "Settings":
+        """Load settings from YAML file, with environment variable overrides."""
+        config_data = {}
+        if Path(path).exists():
+            with open(path) as f:
+                config_data = yaml.safe_load(f) or {}
+        return cls(**config_data)
+    
+    class Config:
+        env_file = ".env"
+        env_nested_delimiter = "__"
+
+
+# Global settings instance
+settings = Settings.from_yaml()
+```
+
+---
+
+## 5. LLM Abstraction Layer
+
+### 5.1 Base Interface (src/agent/llm/base.py)
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import List, Optional, AsyncIterator, Any, Dict
+from enum import Enum
+
+
+class StopReason(Enum):
+    END_TURN = "end_turn"
+    TOOL_USE = "tool_use"
+    MAX_TOKENS = "max_tokens"
+    ERROR = "error"
+
+
+@dataclass
+class LLMMessage:
+    """Unified message format across providers."""
+    role: str  # "system" | "user" | "assistant" | "tool_result"
+    content: str
+    tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[Dict]] = None
+    
+    def to_dict(self) -> dict:
+        return {
+            "role": self.role,
+            "content": self.content,
+            "tool_call_id": self.tool_call_id,
+            "tool_calls": self.tool_calls
+        }
+
+
+@dataclass
+class ToolCall:
+    """Represents a tool call from the LLM."""
+    id: str
+    name: str
+    input: Dict[str, Any]
+
+
+@dataclass
+class LLMResponse:
+    """Complete response from LLM."""
+    content: str
+    tool_calls: List[ToolCall] = field(default_factory=list)
+    stop_reason: StopReason = StopReason.END_TURN
+    usage: Dict[str, int] = field(default_factory=dict)
+    
+    @property
+    def has_tool_calls(self) -> bool:
+        return len(self.tool_calls) > 0
+
+
+@dataclass
+class StreamChunk:
+    """Streaming chunk from LLM."""
+    type: str  # "text_delta" | "tool_use_start" | "tool_use_delta" | "tool_use_complete" | "done" | "error"
+    content: str = ""
+    tool_call: Optional[ToolCall] = None
+    error: Optional[str] = None
+
+
+class BaseLLM(ABC):
+    """Abstract interface for LLM providers. Implement this to add new models."""
+    
+    @property
+    @abstractmethod
+    def provider_name(self) -> str:
+        """Return provider identifier (e.g., 'anthropic', 'openai')."""
+        pass
+    
+    @property
+    @abstractmethod
+    def model_name(self) -> str:
+        """Return the model identifier."""
+        pass
+    
+    @abstractmethod
+    async def complete(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict]] = None,
+        system_prompt: Optional[str] = None,
+        **kwargs
+    ) -> LLMResponse:
+        """Generate a completion (non-streaming)."""
+        pass
+    
+    @abstractmethod
+    async def stream(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict]] = None,
+        system_prompt: Optional[str] = None,
+        **kwargs
+    ) -> AsyncIterator[StreamChunk]:
+        """Generate a streaming completion."""
+        pass
+    
+    def format_tool_schema(self, tool: Dict) -> Dict:
+        """
+        Convert generic tool schema to provider-specific format.
+        Override in subclasses if needed.
+        """
+        return tool
+```
+
+### 5.2 Anthropic Adapter (src/agent/llm/anthropic.py)
+
+```python
+from anthropic import AsyncAnthropic
+from .base import BaseLLM, LLMMessage, LLMResponse, StreamChunk, ToolCall, StopReason
+from typing import List, Optional, AsyncIterator, Dict, Any
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class AnthropicLLM(BaseLLM):
+    """Claude adapter with streaming and prompt caching support."""
+    
+    def __init__(
+        self,
+        model: str = "claude-sonnet-4-5-20250929",
+        api_key: Optional[str] = None,
+        enable_cache: bool = True,
+        max_tokens: int = 4096,
+        temperature: float = 0.7
+    ):
+        self._model = model
+        self._client = AsyncAnthropic(api_key=api_key)
+        self._enable_cache = enable_cache
+        self._max_tokens = max_tokens
+        self._temperature = temperature
+    
+    @property
+    def provider_name(self) -> str:
+        return "anthropic"
+    
+    @property
+    def model_name(self) -> str:
+        return self._model
+    
+    def _convert_messages(self, messages: List[LLMMessage]) -> List[Dict]:
+        """Convert unified messages to Anthropic format."""
+        converted = []
+        
+        for msg in messages:
+            if msg.role == "system":
+                # System messages handled separately in Anthropic
+                continue
+            
+            if msg.role == "tool_result":
+                converted.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": msg.tool_call_id,
+                        "content": msg.content
+                    }]
+                })
+            elif msg.tool_calls:
+                # Assistant message with tool calls
+                content = []
+                if msg.content:
+                    content.append({"type": "text", "text": msg.content})
+                for tc in msg.tool_calls:
+                    content.append({
+                        "type": "tool_use",
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "input": tc["input"]
+                    })
+                converted.append({"role": "assistant", "content": content})
+            else:
+                converted.append({
+                    "role": msg.role,
+                    "content": msg.content
+                })
+        
+        return converted
+    
+    def _convert_tools(self, tools: List[Dict]) -> List[Dict]:
+        """Convert generic tool schemas to Anthropic format."""
+        return [
+            {
+                "name": t["name"],
+                "description": t["description"],
+                "input_schema": t["parameters"]
+            }
+            for t in tools
+        ]
+    
+    def _build_system_prompt(self, system_prompt: str) -> Any:
+        """Build system prompt with optional caching."""
+        if self._enable_cache:
+            return [{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"}
+            }]
+        return system_prompt
+    
+    def _parse_stop_reason(self, reason: str) -> StopReason:
+        """Convert Anthropic stop reason to unified format."""
+        mapping = {
+            "end_turn": StopReason.END_TURN,
+            "tool_use": StopReason.TOOL_USE,
+            "max_tokens": StopReason.MAX_TOKENS,
+        }
+        return mapping.get(reason, StopReason.END_TURN)
+    
+    async def complete(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict]] = None,
+        system_prompt: Optional[str] = None,
+        **kwargs
+    ) -> LLMResponse:
+        """Generate completion with optional tool use."""
+        request = {
+            "model": self._model,
+            "max_tokens": kwargs.get("max_tokens", self._max_tokens),
+            "temperature": kwargs.get("temperature", self._temperature),
+            "messages": self._convert_messages(messages),
+        }
+        
+        if system_prompt:
+            request["system"] = self._build_system_prompt(system_prompt)
+        
+        if tools:
+            request["tools"] = self._convert_tools(tools)
+        
+        try:
+            response = await self._client.messages.create(**request)
+        except Exception as e:
+            logger.error(f"Anthropic API error: {e}")
+            raise
+        
+        # Parse response
+        content = ""
+        tool_calls = []
+        
+        for block in response.content:
+            if block.type == "text":
+                content += block.text
+            elif block.type == "tool_use":
+                tool_calls.append(ToolCall(
+                    id=block.id,
+                    name=block.name,
+                    input=block.input
+                ))
+        
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            stop_reason=self._parse_stop_reason(response.stop_reason),
+            usage={
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "cache_read_tokens": getattr(response.usage, 'cache_read_input_tokens', 0),
+                "cache_creation_tokens": getattr(response.usage, 'cache_creation_input_tokens', 0),
+            }
+        )
+    
+    async def stream(
+        self,
+        messages: List[LLMMessage],
+        tools: Optional[List[Dict]] = None,
+        system_prompt: Optional[str] = None,
+        **kwargs
+    ) -> AsyncIterator[StreamChunk]:
+        """Stream completion with real-time token delivery."""
+        request = {
+            "model": self._model,
+            "max_tokens": kwargs.get("max_tokens", self._max_tokens),
+            "temperature": kwargs.get("temperature", self._temperature),
+            "messages": self._convert_messages(messages),
+        }
+        
+        if system_prompt:
+            request["system"] = self._build_system_prompt(system_prompt)
+        
+        if tools:
+            request["tools"] = self._convert_tools(tools)
+        
+        try:
+            async with self._client.messages.stream(**request) as stream:
+                current_tool: Optional[Dict] = None
+                tool_input_json = ""
+                
+                async for event in stream:
+                    if event.type == "content_block_start":
+                        block = event.content_block
+                        if hasattr(block, 'type'):
+                            if block.type == "tool_use":
+                                current_tool = {
+                                    "id": block.id,
+                                    "name": block.name,
+                                }
+                                tool_input_json = ""
+                                yield StreamChunk(
+                                    type="tool_use_start",
+                                    tool_call=ToolCall(
+                                        id=block.id,
+                                        name=block.name,
+                                        input={}
+                                    )
+                                )
+                    
+                    elif event.type == "content_block_delta":
+                        delta = event.delta
+                        if hasattr(delta, 'text'):
+                            yield StreamChunk(type="text_delta", content=delta.text)
+                        elif hasattr(delta, 'partial_json'):
+                            tool_input_json += delta.partial_json
+                    
+                    elif event.type == "content_block_stop":
+                        if current_tool:
+                            # Parse complete tool input
+                            try:
+                                parsed_input = json.loads(tool_input_json) if tool_input_json else {}
+                            except json.JSONDecodeError:
+                                parsed_input = {"raw": tool_input_json}
+                            
+                            yield StreamChunk(
+                                type="tool_use_complete",
+                                tool_call=ToolCall(
+                                    id=current_tool["id"],
+                                    name=current_tool["name"],
+                                    input=parsed_input
+                                )
+                            )
+                            current_tool = None
+                            tool_input_json = ""
+                    
+                    elif event.type == "message_stop":
+                        yield StreamChunk(type="done")
+        
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            yield StreamChunk(type="error", error=str(e))
+```
+
+### 5.3 LLM Factory (src/agent/llm/factory.py)
+
+```python
+from typing import Dict, Type, Optional
+from .base import BaseLLM
+from .anthropic import AnthropicLLM
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class LLMFactory:
+    """
+    Factory for creating LLM instances.
+    Supports runtime model switching via configuration.
+    """
+    
+    _adapters: Dict[str, Type[BaseLLM]] = {
+        "anthropic": AnthropicLLM,
+    }
+    
+    @classmethod
+    def register_provider(cls, name: str, adapter_class: Type[BaseLLM]):
+        """Register a new LLM provider adapter."""
+        cls._adapters[name] = adapter_class
+        logger.info(f"Registered LLM provider: {name}")
+    
+    @classmethod
+    def get_providers(cls) -> list:
+        """List available providers."""
+        return list(cls._adapters.keys())
+    
+    @classmethod
+    def create(
+        cls,
+        provider: str,
+        model: str,
+        api_key: Optional[str] = None,
+        **kwargs
+    ) -> BaseLLM:
+        """Create an LLM instance."""
+        if provider not in cls._adapters:
+            available = ", ".join(cls._adapters.keys())
+            raise ValueError(f"Unknown provider: {provider}. Available: {available}")
+        
+        adapter_class = cls._adapters[provider]
+        return adapter_class(model=model, api_key=api_key, **kwargs)
+    
+    @classmethod
+    def from_config(cls, config: dict) -> BaseLLM:
+        """Create LLM from configuration dictionary."""
+        return cls.create(
+            provider=config["provider"],
+            model=config["model"],
+            api_key=config.get("api_key"),
+            enable_cache=config.get("cache", {}).get("enabled", True),
+            max_tokens=config.get("max_tokens", 4096),
+            temperature=config.get("temperature", 0.7),
+        )
+
+
+# Auto-register OpenAI if available
+try:
+    from .openai import OpenAILLM
+    LLMFactory.register_provider("openai", OpenAILLM)
+except ImportError:
+    pass
+```
+
+---
+
+## 6. Tool System Implementation
+
+### 6.1 Tool Schema Generator (src/agent/tools/schema.py)
+
+```python
+import inspect
+from typing import Callable, Dict, Any, get_type_hints, Optional, List
+from dataclasses import dataclass
+import re
+
+
+# Python type to JSON Schema type mapping
+TYPE_MAP = {
+    str: "string",
+    int: "integer", 
+    float: "number",
+    bool: "boolean",
+    list: "array",
+    dict: "object",
+    type(None): "null",
+}
+
+
+@dataclass
+class ToolSchema:
+    """Represents a tool's schema for LLM consumption."""
+    name: str
+    description: str
+    parameters: Dict[str, Any]
+    
+    def to_dict(self) -> Dict:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters
+        }
+
+
+def parse_docstring(docstring: str) -> Dict[str, str]:
+    """
+    Parse parameter descriptions from docstring.
+    Supports Google and Sphinx styles.
+    """
+    if not docstring:
+        return {}
+    
+    params = {}
+    
+    # Google style: "param_name: description" or "param_name (type): description"
+    google_pattern = r'^\s*(\w+)(?:\s*\([^)]+\))?:\s*(.+)$'
+    
+    # Sphinx style: ":param param_name: description"
+    sphinx_pattern = r':param\s+(\w+):\s*(.+)'
+    
+    lines = docstring.split('\n')
+    in_args_section = False
+    
+    for line in lines:
+        stripped = line.strip()
+        
+        # Check for Args: section (Google style)
+        if stripped.lower() in ('args:', 'arguments:', 'parameters:'):
+            in_args_section = True
+            continue
+        
+        # Check for section end
+        if stripped.lower() in ('returns:', 'raises:', 'example:', 'examples:'):
+            in_args_section = False
+            continue
+        
+        # Sphinx style
+        sphinx_match = re.match(sphinx_pattern, stripped)
+        if sphinx_match:
+            params[sphinx_match.group(1)] = sphinx_match.group(2).strip()
+            continue
+        
+        # Google style (only in args section)
+        if in_args_section:
+            google_match = re.match(google_pattern, stripped)
+            if google_match:
+                params[google_match.group(1)] = google_match.group(2).strip()
+    
+    return params
+
+
+def function_to_schema(
+    func: Callable,
+    name_override: Optional[str] = None,
+    description_override: Optional[str] = None
+) -> ToolSchema:
+    """
+    Auto-generate JSON Schema from a Python function.
+    Uses type hints and docstring for schema generation.
+    """
+    sig = inspect.signature(func)
+    hints = get_type_hints(func)
+    docstring = inspect.getdoc(func) or ""
+    
+    # Parse parameter descriptions from docstring
+    param_docs = parse_docstring(docstring)
+    
+    # Extract main description (first paragraph)
+    main_description = docstring.split('\n\n')[0].strip() if docstring else ""
+    
+    # Build properties and required list
+    properties = {}
+    required = []
+    
+    for param_name, param in sig.parameters.items():
+        # Skip special parameters
+        if param_name in ("self", "cls", "ctx", "context", "_"):
+            continue
+        
+        # Get type
+        param_type = hints.get(param_name, str)
+        
+        # Handle Optional types
+        origin = getattr(param_type, '__origin__', None)
+        if origin is type(None):
+            json_type = "null"
+        elif origin:
+            # For List[X], Dict[X, Y], etc., use the base type
+            json_type = TYPE_MAP.get(origin, "string")
+        else:
+            json_type = TYPE_MAP.get(param_type, "string")
+        
+        # Build property schema
+        prop_schema = {
+            "type": json_type,
+            "description": param_docs.get(param_name, f"The {param_name} parameter")
+        }
+        
+        # Add enum if it's a Literal type
+        if hasattr(param_type, '__args__') and hasattr(param_type, '__origin__'):
+            from typing import Literal
+            if getattr(param_type, '__origin__', None) is Literal:
+                prop_schema["enum"] = list(param_type.__args__)
+        
+        properties[param_name] = prop_schema
+        
+        # Check if required (no default value)
+        if param.default == inspect.Parameter.empty:
+            required.append(param_name)
+    
+    return ToolSchema(
+        name=name_override or func.__name__,
+        description=description_override or main_description or func.__name__,
+        parameters={
+            "type": "object",
+            "properties": properties,
+            "required": required
+        }
+    )
+```
+
+### 6.2 Tool Registry (src/agent/tools/registry.py)
+
+```python
+from typing import Callable, Dict, Optional, List, Any
+from dataclasses import dataclass, field
+from .schema import ToolSchema, function_to_schema
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RegisteredTool:
+    """A registered tool with its metadata."""
+    name: str
+    description: str
+    func: Callable
+    schema: ToolSchema
+    is_async: bool
+    timeout: float = 30.0
+    tags: List[str] = field(default_factory=list)
+    enabled: bool = True
+
+
+class ToolRegistry:
+    """
+    Central registry for tools.
+    Supports decorator-based and programmatic registration.
+    """
+    
+    def __init__(self):
+        self._tools: Dict[str, RegisteredTool] = {}
+    
+    def tool(
+        self,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        timeout: float = 30.0,
+        tags: Optional[List[str]] = None
+    ) -> Callable:
+        """
+        Decorator for registering a function as a tool.
+        
+        Example:
+            @registry.tool(name="search", description="Search the web")
+            async def web_search(query: str) -> str:
+                ...
+        """
+        def decorator(func: Callable) -> Callable:
+            tool_name = name or func.__name__
+            schema = function_to_schema(func, name_override=tool_name, description_override=description)
+            
+            # Override description if provided
+            if description:
+                schema.description = description
+            
+            registered = RegisteredTool(
+                name=tool_name,
+                description=schema.description,
+                func=func,
+                schema=schema,
+                is_async=asyncio.iscoroutinefunction(func),
+                timeout=timeout,
+                tags=tags or []
+            )
+            
+            self._tools[tool_name] = registered
+            logger.debug(f"Registered tool: {tool_name}")
+            
+            return func
+        
+        return decorator
+    
+    def register(
+        self,
+        func: Callable,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        timeout: float = 30.0,
+        tags: Optional[List[str]] = None
+    ):
+        """Programmatically register a tool."""
+        self.tool(name=name, description=description, timeout=timeout, tags=tags)(func)
+    
+    def unregister(self, name: str) -> bool:
+        """Remove a tool from the registry."""
+        if name in self._tools:
+            del self._tools[name]
+            logger.debug(f"Unregistered tool: {name}")
+            return True
+        return False
+    
+    def get(self, name: str) -> Optional[RegisteredTool]:
+        """Get a registered tool by name."""
+        return self._tools.get(name)
+    
+    def get_schema(self, name: str) -> Optional[Dict]:
+        """Get a tool's schema by name."""
+        tool = self._tools.get(name)
+        return tool.schema.to_dict() if tool else None
+    
+    def list_tools(self, tags: Optional[List[str]] = None) -> List[RegisteredTool]:
+        """List all registered tools, optionally filtered by tags."""
+        tools = list(self._tools.values())
+        if tags:
+            tools = [t for t in tools if any(tag in t.tags for tag in tags)]
+        return [t for t in tools if t.enabled]
+    
+    def list_schemas(self, tags: Optional[List[str]] = None) -> List[Dict]:
+        """Get all tool schemas for LLM consumption."""
+        return [t.schema.to_dict() for t in self.list_tools(tags=tags)]
+    
+    def list_names(self) -> List[str]:
+        """Get names of all registered tools."""
+        return [t.name for t in self.list_tools()]
+    
+    def enable(self, name: str):
+        """Enable a tool."""
+        if tool := self._tools.get(name):
+            tool.enabled = True
+    
+    def disable(self, name: str):
+        """Disable a tool without unregistering."""
+        if tool := self._tools.get(name):
+            tool.enabled = False
+
+
+# Global registry instance
+registry = ToolRegistry()
+
+
+# Convenience decorator using global registry
+def tool(
+    name: str = None,
+    description: str = None,
+    timeout: float = 30.0,
+    tags: List[str] = None
+):
+    """Decorator for registering tools to the global registry."""
+    return registry.tool(name=name, description=description, timeout=timeout, tags=tags)
+```
+
+### 6.3 Tool Executor (src/agent/tools/executor.py)
+
+```python
+import asyncio
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass
+from .registry import ToolRegistry, RegisteredTool
+from ..resilience.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
+import logging
+import traceback
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ToolResult:
+    """Result of a tool execution."""
+    tool_call_id: str
+    tool_name: str
+    success: bool
+    result: Any
+    error: Optional[str] = None
+    execution_time_ms: float = 0
+    
+    def to_message_content(self) -> str:
+        """Format result for LLM consumption."""
+        if self.success:
+            return str(self.result) if self.result is not None else "Success (no output)"
+        else:
+            return f"Error: {self.error}"
+
+
+class ToolExecutor:
+    """
+    Executes tools with:
+    - Timeout protection
+    - Circuit breaker for fault tolerance
+    - Parallel execution support
+    - Detailed error handling
+    """
+    
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        default_timeout: float = 30.0,
+        circuit_breaker_threshold: int = 5,
+        circuit_breaker_timeout: int = 60
+    ):
+        self.registry = registry
+        self.default_timeout = default_timeout
+        self._circuit_breakers: Dict[str, CircuitBreaker] = {}
+        self._cb_threshold = circuit_breaker_threshold
+        self._cb_timeout = circuit_breaker_timeout
+    
+    def _get_circuit_breaker(self, tool_name: str) -> CircuitBreaker:
+        """Get or create circuit breaker for a tool."""
+        if tool_name not in self._circuit_breakers:
+            self._circuit_breakers[tool_name] = CircuitBreaker(
+                failure_threshold=self._cb_threshold,
+                recovery_timeout=self._cb_timeout,
+                name=f"tool:{tool_name}"
+            )
+        return self._circuit_breakers[tool_name]
+    
+    async def execute(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: Dict[str, Any]
+    ) -> ToolResult:
+        """Execute a single tool call with all protections."""
+        import time
+        start_time = time.time()
+        
+        # Get tool from registry
+        tool = self.registry.get(tool_name)
+        if not tool:
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                success=False,
+                result=None,
+                error=f"Unknown tool: '{tool_name}'. Available tools: {', '.join(self.registry.list_names())}"
+            )
+        
+        if not tool.enabled:
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                success=False,
+                result=None,
+                error=f"Tool '{tool_name}' is currently disabled"
+            )
+        
+        # Check circuit breaker
+        cb = self._get_circuit_breaker(tool_name)
+        try:
+            cb.check()
+        except CircuitBreakerOpen:
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                success=False,
+                result=None,
+                error=f"Tool '{tool_name}' is temporarily unavailable due to repeated failures. It will be retried automatically."
+            )
+        
+        # Execute with timeout
+        try:
+            timeout = tool.timeout or self.default_timeout
+            
+            if tool.is_async:
+                result = await asyncio.wait_for(
+                    tool.func(**arguments),
+                    timeout=timeout
+                )
+            else:
+                # Run sync function in thread pool
+                result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: tool.func(**arguments)
+                    ),
+                    timeout=timeout
+                )
+            
+            cb.record_success()
+            execution_time = (time.time() - start_time) * 1000
+            
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                success=True,
+                result=result,
+                execution_time_ms=execution_time
+            )
+        
+        except asyncio.TimeoutError:
+            cb.record_failure()
+            execution_time = (time.time() - start_time) * 1000
+            logger.warning(f"Tool '{tool_name}' timed out after {timeout}s")
+            
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                success=False,
+                result=None,
+                error=f"Tool '{tool_name}' timed out after {timeout} seconds",
+                execution_time_ms=execution_time
+            )
+        
+        except Exception as e:
+            cb.record_failure()
+            execution_time = (time.time() - start_time) * 1000
+            logger.exception(f"Tool '{tool_name}' failed with error: {e}")
+            
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                success=False,
+                result=None,
+                error=f"Tool execution error: {str(e)}",
+                execution_time_ms=execution_time
+            )
+    
+    async def execute_parallel(
+        self,
+        tool_calls: List[Dict[str, Any]]
+    ) -> List[ToolResult]:
+        """
+        Execute multiple tool calls in parallel.
+        
+        Args:
+            tool_calls: List of dicts with 'id', 'name', 'input' keys
+        """
+        tasks = [
+            self.execute(
+                tool_call_id=tc["id"],
+                tool_name=tc["name"],
+                arguments=tc.get("input", {})
+            )
+            for tc in tool_calls
+        ]
+        return await asyncio.gather(*tasks)
+    
+    def get_circuit_breaker_status(self) -> Dict[str, str]:
+        """Get status of all circuit breakers."""
+        return {
+            name: cb.state.value
+            for name, cb in self._circuit_breakers.items()
+        }
+```
+
+### 6.4 Built-in Tools (src/agent/tools/builtin/core_tools.py)
+
+These are the **critical tools** that enable skill execution:
+
+```python
+"""
+Core built-in tools for agent operation.
+These tools enable skill reading and command execution.
+"""
+
+from ..registry import tool
+from ...skills.index import skill_index
+from ...skills.executor import SkillCommandExecutor
+from typing import Optional
+import json
+
+
+# Skill command executor instance (initialized in main.py)
+_command_executor: Optional[SkillCommandExecutor] = None
+
+
+def set_command_executor(executor: SkillCommandExecutor):
+    """Set the command executor instance (called during startup)."""
+    global _command_executor
+    _command_executor = executor
+
+
+@tool(
+    name="get_current_time",
+    description="Get the current date and time. Use this when the user asks what time it is or needs the current date.",
+    timeout=5.0,
+    tags=["utility"]
+)
+def get_current_time() -> str:
+    """
+    Get the current date and time.
+    
+    Returns:
+        Current datetime as a formatted string
+    """
+    from datetime import datetime
+    now = datetime.now()
+    return now.strftime("%I:%M %p on %A, %B %d, %Y")
+
+
+@tool(
+    name="list_skills",
+    description="List all available skills with their descriptions. Use this to discover what capabilities are available before attempting a task.",
+    timeout=5.0,
+    tags=["system", "discovery"]
+)
+def list_skills() -> str:
+    """
+    List all available skills.
+    
+    Returns:
+        JSON list of skills with name and description
+    """
+    skills = skill_index.list_skills()
+    return json.dumps([
+        {"name": s.name, "description": s.description}
+        for s in skills
+    ], indent=2)
+
+
+@tool(
+    name="read_skill",
+    description="Read the documentation for a specific skill. This returns the SKILL.md content which explains how to use the skill, including command formats and examples. ALWAYS read a skill's documentation before using it.",
+    timeout=10.0,
+    tags=["system", "discovery"]
+)
+def read_skill(skill_name: str) -> str:
+    """
+    Read a skill's documentation.
+    
+    Args:
+        skill_name: Name of the skill to read (e.g., "calculator")
+    
+    Returns:
+        The full SKILL.md content for the skill
+    """
+    skill = skill_index.get_skill(skill_name)
+    if not skill:
+        available = [s.name for s in skill_index.list_skills()]
+        return f"Skill '{skill_name}' not found. Available skills: {', '.join(available)}"
+    
+    return skill.documentation
+
+
+@tool(
+    name="execute_command",
+    description="Execute a shell command. Use this to run skill scripts after reading the skill documentation. The command will be executed in the skills directory.",
+    timeout=60.0,
+    tags=["system", "execution"]
+)
+async def execute_command(command: str, working_dir: Optional[str] = None) -> str:
+    """
+    Execute a shell command.
+    
+    Args:
+        command: The shell command to execute (e.g., "python3 scripts/calc.py calc add 5 3")
+        working_dir: Optional working directory relative to skills base path
+    
+    Returns:
+        Command output (stdout) or error message
+    """
+    if _command_executor is None:
+        return "Error: Command executor not initialized"
+    
+    result = await _command_executor.execute(command, working_dir=working_dir)
+    
+    if result.success:
+        return result.stdout or "Command completed successfully (no output)"
+    else:
+        error_msg = result.stderr or result.error or "Unknown error"
+        return f"Command failed: {error_msg}"
+```
+
+---
+
+## 7. Skill System Implementation
+
+### 7.1 Skill Loader (src/agent/skills/loader.py)
+
+```python
+"""
+Parses SKILL.md files to extract skill metadata and documentation.
+"""
+
+import frontmatter
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, List
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SkillMetadata:
+    """Parsed skill information."""
+    name: str
+    description: str
+    path: Path
+    documentation: str  # Full SKILL.md content
+    scripts_path: Optional[Path] = None
+    
+    @property
+    def has_scripts(self) -> bool:
+        return self.scripts_path is not None and self.scripts_path.exists()
+
+
+class SkillLoader:
+    """Loads and parses SKILL.md files."""
+    
+    @staticmethod
+    def load(skill_path: Path) -> Optional[SkillMetadata]:
+        """
+        Load a skill from a directory.
+        
+        Args:
+            skill_path: Path to skill directory containing SKILL.md
+        
+        Returns:
+            SkillMetadata or None if invalid
+        """
+        skill_md_path = skill_path / "SKILL.md"
+        
+        if not skill_md_path.exists():
+            logger.warning(f"No SKILL.md found in {skill_path}")
+            return None
+        
+        try:
+            # Parse frontmatter and content
+            with open(skill_md_path, 'r', encoding='utf-8') as f:
+                post = frontmatter.load(f)
+            
+            # Extract required fields
+            name = post.get('name')
+            if not name:
+                # Fallback to directory name
+                name = skill_path.name
+            
+            description = post.get('description', f"Skill: {name}")
+            
+            # Full documentation (frontmatter + content)
+            full_doc = skill_md_path.read_text(encoding='utf-8')
+            
+            # Check for scripts directory
+            scripts_path = skill_path / "scripts"
+            if not scripts_path.exists():
+                scripts_path = None
+            
+            return SkillMetadata(
+                name=name,
+                description=description,
+                path=skill_path,
+                documentation=full_doc,
+                scripts_path=scripts_path
+            )
+        
+        except Exception as e:
+            logger.error(f"Failed to load skill from {skill_path}: {e}")
+            return None
+    
+    @staticmethod
+    def discover(base_path: Path) -> List[SkillMetadata]:
+        """
+        Discover all skills in a directory.
+        
+        Args:
+            base_path: Root directory to scan for skills
+        
+        Returns:
+            List of discovered skills
+        """
+        skills = []
+        
+        if not base_path.exists():
+            logger.warning(f"Skills base path does not exist: {base_path}")
+            return skills
+        
+        # Each subdirectory is a potential skill
+        for item in base_path.iterdir():
+            if item.is_dir() and not item.name.startswith('.'):
+                skill = SkillLoader.load(item)
+                if skill:
+                    skills.append(skill)
+                    logger.info(f"Discovered skill: {skill.name}")
+        
+        return skills
+```
+
+### 7.2 Skill Index (src/agent/skills/index.py)
+
+```python
+"""
+Central index of available skills.
+"""
+
+from pathlib import Path
+from typing import Dict, List, Optional
+from .loader import SkillLoader, SkillMetadata
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class SkillIndex:
+    """
+    Maintains an index of all available skills.
+    Supports discovery and lookup.
+    """
+    
+    def __init__(self, base_path: Optional[str] = None):
+        self._skills: Dict[str, SkillMetadata] = {}
+        self._base_path = Path(base_path) if base_path else None
+    
+    def set_base_path(self, path: str):
+        """Set the skills base directory."""
+        self._base_path = Path(path)
+    
+    def discover(self):
+        """Scan base path and index all skills."""
+        if not self._base_path:
+            logger.warning("No base path set for skill discovery")
+            return
+        
+        self._skills.clear()
+        skills = SkillLoader.discover(self._base_path)
+        
+        for skill in skills:
+            self._skills[skill.name] = skill
+        
+        logger.info(f"Indexed {len(self._skills)} skills")
+    
+    def register(self, skill: SkillMetadata):
+        """Manually register a skill."""
+        self._skills[skill.name] = skill
+    
+    def unregister(self, name: str) -> bool:
+        """Remove a skill from the index."""
+        if name in self._skills:
+            del self._skills[name]
+            return True
+        return False
+    
+    def get_skill(self, name: str) -> Optional[SkillMetadata]:
+        """Get a skill by name."""
+        return self._skills.get(name)
+    
+    def list_skills(self) -> List[SkillMetadata]:
+        """List all indexed skills."""
+        return list(self._skills.values())
+    
+    def get_skill_summaries(self) -> List[Dict]:
+        """Get summaries for system prompt inclusion."""
+        return [
+            {"name": s.name, "description": s.description}
+            for s in self._skills.values()
+        ]
+    
+    @property
+    def base_path(self) -> Optional[Path]:
+        return self._base_path
+
+
+# Global skill index instance
+skill_index = SkillIndex()
+```
+
+### 7.3 Skill Command Executor (src/agent/skills/executor.py)
+
+```python
+"""
+Secure command execution for skills.
+"""
+
+import asyncio
+import shlex
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, List
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CommandResult:
+    """Result of command execution."""
+    success: bool
+    stdout: str
+    stderr: str
+    return_code: int
+    error: Optional[str] = None
+
+
+class SkillCommandExecutor:
+    """
+    Executes shell commands for skills with security controls.
+    """
+    
+    def __init__(
+        self,
+        base_path: Path,
+        allowed_prefixes: List[str],
+        timeout: int = 60,
+        sandbox: bool = False
+    ):
+        self.base_path = base_path
+        self.allowed_prefixes = allowed_prefixes
+        self.timeout = timeout
+        self.sandbox = sandbox  # Future: container/sandbox execution
+    
+    def _validate_command(self, command: str) -> tuple[bool, str]:
+        """
+        Validate command against security rules.
+        
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if not command or not command.strip():
+            return False, "Empty command"
+        
+        # Check if command starts with allowed prefix
+        parts = shlex.split(command)
+        if not parts:
+            return False, "Invalid command format"
+        
+        cmd_prefix = parts[0].lower()
+        
+        # Allow full paths to python
+        if '/' in cmd_prefix:
+            cmd_prefix = cmd_prefix.split('/')[-1]
+        
+        allowed = any(cmd_prefix.startswith(prefix.lower()) for prefix in self.allowed_prefixes)
+        
+        if not allowed:
+            return False, f"Command '{parts[0]}' not allowed. Allowed: {', '.join(self.allowed_prefixes)}"
+        
+        # Check for dangerous patterns
+        dangerous_patterns = [
+            '&&', '||', ';', '|',  # Command chaining
+            '>', '>>', '<',        # Redirections (except in args)
+            '`', '$(',             # Command substitution
+            'rm -rf', 'rm -fr',    # Dangerous operations
+            '/etc/', '/root/',     # Sensitive paths
+        ]
+        
+        for pattern in dangerous_patterns:
+            if pattern in command and pattern not in ('>>', '>'):  # Allow some patterns in arguments
+                # More nuanced check - only block if pattern is part of shell syntax
+                if pattern in ('&&', '||', ';', '|', '`', '$('):
+                    return False, f"Shell operators not allowed: {pattern}"
+        
+        return True, ""
+    
+    async def execute(
+        self,
+        command: str,
+        working_dir: Optional[str] = None
+    ) -> CommandResult:
+        """
+        Execute a command securely.
+        
+        Args:
+            command: Shell command to execute
+            working_dir: Optional subdirectory within base_path
+        
+        Returns:
+            CommandResult with output and status
+        """
+        # Validate command
+        is_valid, error = self._validate_command(command)
+        if not is_valid:
+            return CommandResult(
+                success=False,
+                stdout="",
+                stderr="",
+                return_code=-1,
+                error=error
+            )
+        
+        # Determine working directory
+        cwd = self.base_path
+        if working_dir:
+            cwd = self.base_path / working_dir
+            if not cwd.exists():
+                return CommandResult(
+                    success=False,
+                    stdout="",
+                    stderr="",
+                    return_code=-1,
+                    error=f"Working directory not found: {working_dir}"
+                )
+        
+        try:
+            logger.debug(f"Executing command: {command} in {cwd}")
+            
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(cwd)
+            )
+            
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.timeout
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                return CommandResult(
+                    success=False,
+                    stdout="",
+                    stderr="",
+                    return_code=-1,
+                    error=f"Command timed out after {self.timeout} seconds"
+                )
+            
+            stdout_str = stdout.decode('utf-8', errors='replace').strip()
+            stderr_str = stderr.decode('utf-8', errors='replace').strip()
+            
+            success = process.returncode == 0
+            
+            if not success:
+                logger.warning(f"Command failed with code {process.returncode}: {stderr_str}")
+            
+            return CommandResult(
+                success=success,
+                stdout=stdout_str,
+                stderr=stderr_str,
+                return_code=process.returncode
+            )
+        
+        except Exception as e:
+            logger.exception(f"Command execution error: {e}")
+            return CommandResult(
+                success=False,
+                stdout="",
+                stderr="",
+                return_code=-1,
+                error=str(e)
+            )
+```
+
+---
+
+## 8. Core Agent with ReAct Loop
+
+### 8.1 Memory Management (src/agent/core/memory.py)
+
+```python
+"""
+Conversation memory management.
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Optional
+from ..llm.base import LLMMessage, ToolCall
+import json
+
+
+@dataclass
+class ConversationMemory:
+    """
+    Manages conversation history with context window awareness.
+    """
+    
+    max_messages: int = 100  # Maximum messages to retain
+    messages: List[LLMMessage] = field(default_factory=list)
+    
+    def add_user_message(self, content: str):
+        """Add a user message to history."""
+        self.messages.append(LLMMessage(role="user", content=content))
+        self._trim_if_needed()
+    
+    def add_assistant_message(
+        self,
+        content: str,
+        tool_calls: Optional[List[ToolCall]] = None
+    ):
+        """Add an assistant message to history."""
+        tc_dicts = None
+        if tool_calls:
+            tc_dicts = [
+                {"id": tc.id, "name": tc.name, "input": tc.input}
+                for tc in tool_calls
+            ]
+        
+        self.messages.append(LLMMessage(
+            role="assistant",
+            content=content,
+            tool_calls=tc_dicts
+        ))
+        self._trim_if_needed()
+    
+    def add_tool_result(self, tool_call_id: str, result: str):
+        """Add a tool result to history."""
+        self.messages.append(LLMMessage(
+            role="tool_result",
+            content=result,
+            tool_call_id=tool_call_id
+        ))
+        self._trim_if_needed()
+    
+    def get_messages(self) -> List[LLMMessage]:
+        """Get all messages for LLM context."""
+        return self.messages.copy()
+    
+    def _trim_if_needed(self):
+        """Trim old messages if exceeding limit."""
+        if len(self.messages) > self.max_messages:
+            # Keep the most recent messages
+            excess = len(self.messages) - self.max_messages
+            self.messages = self.messages[excess:]
+    
+    def clear(self):
+        """Clear all history."""
+        self.messages = []
+    
+    def get_last_user_message(self) -> Optional[str]:
+        """Get the most recent user message."""
+        for msg in reversed(self.messages):
+            if msg.role == "user":
+                return msg.content
+        return None
+    
+    def to_dict(self) -> List[dict]:
+        """Serialize for persistence."""
+        return [m.to_dict() for m in self.messages]
+    
+    @classmethod
+    def from_dict(cls, data: List[dict]) -> "ConversationMemory":
+        """Deserialize from persistence."""
+        memory = cls()
+        for item in data:
+            memory.messages.append(LLMMessage(**item))
+        return memory
+```
+
+### 8.2 ReAct Agent (src/agent/core/agent.py)
+
+```python
+"""
+Main ReAct (Reasoning + Acting) agent implementation.
+"""
+
+from typing import AsyncIterator, List, Optional, Dict, Any
+from dataclasses import dataclass, field
+from ..llm.base import BaseLLM, LLMMessage, LLMResponse, StreamChunk, ToolCall, StopReason
+from ..tools.registry import ToolRegistry
+from ..tools.executor import ToolExecutor, ToolResult
+from ..skills.index import SkillIndex
+from .memory import ConversationMemory
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AgentEvent:
+    """Event emitted during agent processing."""
+    type: str
+    data: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AgentResponse:
+    """Complete response from the agent."""
+    content: str
+    tool_calls_made: List[Dict]
+    iterations: int
+    total_time_ms: float
+
+
+class ReactAgent:
+    """
+    ReAct agent that combines reasoning and acting.
+    
+    Supports:
+    - Direct tool calls (JSON Schema tools)
+    - Skill-based execution (read SKILL.md → execute commands)
+    - Streaming responses
+    - Fault tolerance and recovery
+    """
+    
+    def __init__(
+        self,
+        llm: BaseLLM,
+        tool_registry: ToolRegistry,
+        skill_index: SkillIndex,
+        system_prompt: str,
+        max_iterations: int = 15
+    ):
+        self.llm = llm
+        self.tool_registry = tool_registry
+        self.skill_index = skill_index
+        self.executor = ToolExecutor(tool_registry)
+        self.system_prompt = system_prompt
+        self.max_iterations = max_iterations
+        self.memory = ConversationMemory()
+    
+    def _build_system_prompt(self) -> str:
+        """Build complete system prompt with skill information."""
+        skill_info = ""
+        skills = self.skill_index.list_skills()
+        
+        if skills:
+            skill_list = "\n".join([
+                f"- **{s.name}**: {s.description}"
+                for s in skills
+            ])
+            skill_info = f"""
+
+## Available Skills
+
+The following skills are available. Use `read_skill` to get documentation before using a skill:
+
+{skill_list}
+
+**Important**: Always call `read_skill("skill_name")` to read the SKILL.md documentation BEFORE attempting to use any skill. The documentation contains the exact command formats and examples you need.
+"""
+        
+        return self.system_prompt + skill_info
+    
+    async def process(self, user_message: str) -> AgentResponse:
+        """
+        Process a user message through the ReAct loop.
+        Non-streaming version.
+        """
+        start_time = time.time()
+        self.memory.add_user_message(user_message)
+        
+        tool_calls_made = []
+        final_content = ""
+        iterations = 0
+        
+        system_prompt = self._build_system_prompt()
+        tool_schemas = self.tool_registry.list_schemas()
+        
+        for iteration in range(self.max_iterations):
+            iterations = iteration + 1
+            logger.debug(f"ReAct iteration {iterations}")
+            
+            try:
+                response = await self.llm.complete(
+                    messages=self.memory.get_messages(),
+                    tools=tool_schemas,
+                    system_prompt=system_prompt
+                )
+            except Exception as e:
+                logger.error(f"LLM error on iteration {iterations}: {e}")
+                final_content = f"I encountered an error while processing your request: {str(e)}"
+                break
+            
+            # No tool calls = final response
+            if not response.has_tool_calls:
+                final_content = response.content
+                self.memory.add_assistant_message(response.content)
+                break
+            
+            # Record assistant message with tool calls
+            self.memory.add_assistant_message(
+                content=response.content,
+                tool_calls=response.tool_calls
+            )
+            
+            # Execute all tool calls in parallel
+            tool_call_dicts = [
+                {"id": tc.id, "name": tc.name, "input": tc.input}
+                for tc in response.tool_calls
+            ]
+            
+            results = await self.executor.execute_parallel(tool_call_dicts)
+            
+            # Process results
+            for result in results:
+                tool_calls_made.append({
+                    "name": result.tool_name,
+                    "success": result.success,
+                    "time_ms": result.execution_time_ms
+                })
+                
+                self.memory.add_tool_result(
+                    tool_call_id=result.tool_call_id,
+                    result=result.to_message_content()
+                )
+        else:
+            # Reached max iterations
+            final_content = "I've reached my maximum number of steps for this task. Here's what I was able to accomplish so far."
+            logger.warning(f"Max iterations ({self.max_iterations}) reached")
+        
+        total_time = (time.time() - start_time) * 1000
+        
+        return AgentResponse(
+            content=final_content,
+            tool_calls_made=tool_calls_made,
+            iterations=iterations,
+            total_time_ms=total_time
+        )
+    
+    async def process_stream(
+        self,
+        user_message: str
+    ) -> AsyncIterator[AgentEvent]:
+        """
+        Process with streaming response.
+        Yields events for real-time UI updates.
+        """
+        start_time = time.time()
+        self.memory.add_user_message(user_message)
+        
+        system_prompt = self._build_system_prompt()
+        tool_schemas = self.tool_registry.list_schemas()
+        
+        yield AgentEvent(type="processing_start", data={"message": user_message})
+        
+        for iteration in range(self.max_iterations):
+            yield AgentEvent(type="iteration_start", data={"iteration": iteration + 1})
+            
+            # Collect response through streaming
+            full_content = ""
+            tool_calls: List[ToolCall] = []
+            
+            try:
+                async for chunk in self.llm.stream(
+                    messages=self.memory.get_messages(),
+                    tools=tool_schemas,
+                    system_prompt=system_prompt
+                ):
+                    if chunk.type == "text_delta":
+                        full_content += chunk.content
+                        yield AgentEvent(
+                            type="text_delta",
+                            data={"content": chunk.content}
+                        )
+                    
+                    elif chunk.type == "tool_use_start":
+                        yield AgentEvent(
+                            type="tool_start",
+                            data={"tool_name": chunk.tool_call.name}
+                        )
+                    
+                    elif chunk.type == "tool_use_complete":
+                        tool_calls.append(chunk.tool_call)
+                        yield AgentEvent(
+                            type="tool_call_complete",
+                            data={
+                                "tool_name": chunk.tool_call.name,
+                                "tool_id": chunk.tool_call.id
+                            }
+                        )
+                    
+                    elif chunk.type == "error":
+                        yield AgentEvent(
+                            type="error",
+                            data={"error": chunk.error}
+                        )
+                        return
+                    
+                    elif chunk.type == "done":
+                        pass
+            
+            except Exception as e:
+                logger.exception(f"Streaming error: {e}")
+                yield AgentEvent(type="error", data={"error": str(e)})
+                return
+            
+            # No tool calls = final response
+            if not tool_calls:
+                self.memory.add_assistant_message(full_content)
+                total_time = (time.time() - start_time) * 1000
+                yield AgentEvent(
+                    type="complete",
+                    data={
+                        "content": full_content,
+                        "iterations": iteration + 1,
+                        "total_time_ms": total_time
+                    }
+                )
+                return
+            
+            # Record and execute tools
+            self.memory.add_assistant_message(full_content, tool_calls=tool_calls)
+            
+            yield AgentEvent(
+                type="executing_tools",
+                data={"count": len(tool_calls)}
+            )
+            
+            # Execute tools in parallel
+            tool_call_dicts = [
+                {"id": tc.id, "name": tc.name, "input": tc.input}
+                for tc in tool_calls
+            ]
+            
+            results = await self.executor.execute_parallel(tool_call_dicts)
+            
+            for result in results:
+                self.memory.add_tool_result(
+                    tool_call_id=result.tool_call_id,
+                    result=result.to_message_content()
+                )
+                
+                yield AgentEvent(
+                    type="tool_result",
+                    data={
+                        "tool_name": result.tool_name,
+                        "success": result.success,
+                        "time_ms": result.execution_time_ms
+                    }
+                )
+        
+        # Max iterations reached
+        total_time = (time.time() - start_time) * 1000
+        yield AgentEvent(
+            type="max_iterations",
+            data={
+                "iterations": self.max_iterations,
+                "total_time_ms": total_time
+            }
+        )
+    
+    def reset(self):
+        """Reset conversation state."""
+        self.memory.clear()
+    
+    def update_llm(self, llm: BaseLLM):
+        """Hot-swap the LLM (for model switching)."""
+        self.llm = llm
+        logger.info(f"Switched to LLM: {llm.provider_name}/{llm.model_name}")
+```
+
+---
+
+## 9. Fault Tolerance
+
+### 9.1 Circuit Breaker (src/agent/resilience/circuit_breaker.py)
+
+```python
+"""
+Circuit breaker implementation for fault tolerance.
+"""
+
+from enum import Enum
+from datetime import datetime, timedelta
+from threading import Lock
+from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class CircuitState(Enum):
+    CLOSED = "closed"      # Normal operation
+    OPEN = "open"          # Blocking calls
+    HALF_OPEN = "half_open"  # Testing recovery
+
+
+class CircuitBreakerOpen(Exception):
+    """Raised when circuit breaker is open."""
+    pass
+
+
+class CircuitBreaker:
+    """
+    Prevents cascading failures by tracking errors.
+    
+    States:
+    - CLOSED: Normal operation, tracking failures
+    - OPEN: Blocking all calls after threshold exceeded
+    - HALF_OPEN: Allowing test calls to check recovery
+    """
+    
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: int = 60,
+        success_threshold: int = 2,
+        name: str = "default"
+    ):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.success_threshold = success_threshold
+        self.name = name
+        
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._last_failure: Optional[datetime] = None
+        self._lock = Lock()
+    
+    @property
+    def state(self) -> CircuitState:
+        """Get current state, transitioning if needed."""
+        with self._lock:
+            if self._state == CircuitState.OPEN:
+                if self._should_attempt_reset():
+                    logger.info(f"Circuit breaker '{self.name}' transitioning to HALF_OPEN")
+                    self._state = CircuitState.HALF_OPEN
+                    self._success_count = 0
+            return self._state
+    
+    def _should_attempt_reset(self) -> bool:
+        """Check if enough time has passed to try recovery."""
+        if self._last_failure is None:
+            return False
+        elapsed = datetime.now() - self._last_failure
+        return elapsed > timedelta(seconds=self.recovery_timeout)
+    
+    def check(self):
+        """
+        Check if a call should proceed.
+        
+        Raises:
+            CircuitBreakerOpen: If circuit is open
+        """
+        if self.state == CircuitState.OPEN:
+            raise CircuitBreakerOpen(
+                f"Circuit breaker '{self.name}' is open. "
+                f"Will retry in {self.recovery_timeout}s."
+            )
+    
+    def record_success(self):
+        """Record a successful call."""
+        with self._lock:
+            if self._state == CircuitState.HALF_OPEN:
+                self._success_count += 1
+                if self._success_count >= self.success_threshold:
+                    logger.info(f"Circuit breaker '{self.name}' recovered to CLOSED")
+                    self._state = CircuitState.CLOSED
+                    self._failure_count = 0
+            else:
+                # Reset failure count on success in closed state
+                self._failure_count = 0
+    
+    def record_failure(self):
+        """Record a failed call."""
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure = datetime.now()
+            
+            if self._state == CircuitState.HALF_OPEN:
+                logger.warning(f"Circuit breaker '{self.name}' failed during recovery, reopening")
+                self._state = CircuitState.OPEN
+            elif self._failure_count >= self.failure_threshold:
+                logger.warning(f"Circuit breaker '{self.name}' opened after {self._failure_count} failures")
+                self._state = CircuitState.OPEN
+    
+    def reset(self):
+        """Manually reset the circuit breaker."""
+        with self._lock:
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+            self._success_count = 0
+            self._last_failure = None
+            logger.info(f"Circuit breaker '{self.name}' manually reset")
+```
+
+### 9.2 Retry Utilities (src/agent/resilience/retry.py)
+
+```python
+"""
+Retry utilities with exponential backoff.
+"""
+
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+    RetryError
+)
+import logging
+from typing import Tuple, Type
+
+logger = logging.getLogger(__name__)
+
+
+def with_retry(
+    max_attempts: int = 3,
+    min_wait: float = 1.0,
+    max_wait: float = 30.0,
+    retryable_exceptions: Tuple[Type[Exception], ...] = (ConnectionError, TimeoutError)
+):
+    """
+    Decorator factory for adding retry logic.
+    
+    Args:
+        max_attempts: Maximum retry attempts
+        min_wait: Minimum wait between retries (seconds)
+        max_wait: Maximum wait between retries (seconds)
+        retryable_exceptions: Exception types to retry on
+    """
+    return retry(
+        stop=stop_after_attempt(max_attempts),
+        wait=wait_exponential(multiplier=1, min=min_wait, max=max_wait),
+        retry=retry_if_exception_type(retryable_exceptions),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True
+    )
+
+
+# Pre-configured retry for LLM API calls
+llm_retry = with_retry(
+    max_attempts=3,
+    min_wait=1.0,
+    max_wait=60.0,
+    retryable_exceptions=(ConnectionError, TimeoutError, OSError)
+)
+
+
+# Pre-configured retry for external services
+external_service_retry = with_retry(
+    max_attempts=5,
+    min_wait=0.5,
+    max_wait=30.0,
+    retryable_exceptions=(ConnectionError, TimeoutError)
+)
+```
+
+---
+
+## 10. WebSocket Transport Layer
+
+### 10.1 Message Schemas (src/agent/transport/messages.py)
+
+```python
+"""
+WebSocket message schemas using Pydantic.
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional, Literal, Any, Dict
+from datetime import datetime
+
+
+class ClientMessage(BaseModel):
+    """Message from client to server."""
+    type: Literal["chat", "ping", "reset", "switch_model"]
+    content: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class ServerMessage(BaseModel):
+    """Message from server to client."""
+    type: Literal[
+        "connected",       # Initial connection confirmation
+        "text_delta",      # Streaming text chunk
+        "tool_start",      # Tool execution started
+        "tool_result",     # Tool execution completed
+        "iteration_start", # New ReAct iteration
+        "processing_start",# Started processing message
+        "executing_tools", # About to execute tools
+        "complete",        # Response complete
+        "error",           # Error occurred
+        "pong",            # Heartbeat response
+        "status",          # Status update
+        "model_switched"   # Model changed
+    ]
+    content: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    
+    def to_json_dict(self) -> dict:
+        """Convert to JSON-serializable dict."""
+        return {
+            "type": self.type,
+            "content": self.content,
+            "data": self.data,
+            "timestamp": self.timestamp.isoformat()
+        }
+```
+
+### 10.2 Connection Manager (src/agent/transport/connection.py)
+
+```python
+"""
+WebSocket connection management with heartbeat.
+"""
+
+import asyncio
+from typing import Dict, Optional
+from fastapi import WebSocket
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class ConnectionManager:
+    """
+    Manages WebSocket connections.
+    
+    Features:
+    - Connection tracking by client ID
+    - Heartbeat for stale connection detection
+    - Graceful disconnect handling
+    """
+    
+    def __init__(self, heartbeat_interval: int = 30):
+        self.active_connections: Dict[str, WebSocket] = {}
+        self.heartbeat_interval = heartbeat_interval
+        self._heartbeat_tasks: Dict[str, asyncio.Task] = {}
+        self._connection_times: Dict[str, datetime] = {}
+    
+    async def connect(self, websocket: WebSocket, client_id: str):
+        """Accept and track a new connection."""
+        await websocket.accept()
+        self.active_connections[client_id] = websocket
+        self._connection_times[client_id] = datetime.utcnow()
+        
+        # Start heartbeat task
+        self._heartbeat_tasks[client_id] = asyncio.create_task(
+            self._heartbeat_loop(client_id)
+        )
+        
+        logger.info(f"Client {client_id} connected. Total: {len(self.active_connections)}")
+    
+    def disconnect(self, client_id: str):
+        """Remove a connection."""
+        self.active_connections.pop(client_id, None)
+        self._connection_times.pop(client_id, None)
+        
+        if client_id in self._heartbeat_tasks:
+            self._heartbeat_tasks[client_id].cancel()
+            del self._heartbeat_tasks[client_id]
+        
+        logger.info(f"Client {client_id} disconnected. Total: {len(self.active_connections)}")
+    
+    async def send_json(self, client_id: str, data: dict) -> bool:
+        """Send JSON message to a client."""
+        websocket = self.active_connections.get(client_id)
+        if not websocket:
+            return False
+        
+        try:
+            await websocket.send_json(data)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send to {client_id}: {e}")
+            self.disconnect(client_id)
+            return False
+    
+    async def broadcast(self, data: dict, exclude: Optional[str] = None):
+        """Send message to all connected clients."""
+        for client_id in list(self.active_connections.keys()):
+            if client_id != exclude:
+                await self.send_json(client_id, data)
+    
+    async def _heartbeat_loop(self, client_id: str):
+        """Send periodic pings to detect stale connections."""
+        while client_id in self.active_connections:
+            try:
+                await asyncio.sleep(self.heartbeat_interval)
+                if client_id in self.active_connections:
+                    await self.send_json(client_id, {"type": "ping"})
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Heartbeat failed for {client_id}: {e}")
+                self.disconnect(client_id)
+                break
+    
+    def get_connection_count(self) -> int:
+        """Get number of active connections."""
+        return len(self.active_connections)
+    
+    def get_connection_info(self, client_id: str) -> Optional[dict]:
+        """Get info about a connection."""
+        if client_id not in self.active_connections:
+            return None
+        return {
+            "client_id": client_id,
+            "connected_at": self._connection_times.get(client_id),
+            "active": True
+        }
+```
+
+### 10.3 WebSocket Server (src/agent/transport/server.py)
+
+```python
+"""
+FastAPI WebSocket server for the agent.
+"""
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+from typing import Dict
+import uuid
+import logging
+
+from .connection import ConnectionManager
+from .messages import ClientMessage, ServerMessage
+from ..core.agent import ReactAgent, AgentEvent
+from ..llm.factory import LLMFactory
+from ..tools.registry import registry as tool_registry
+from ..tools.builtin import core_tools
+from ..skills.index import skill_index
+from ..skills.executor import SkillCommandExecutor
+from ..config.settings import settings
+
+logger = logging.getLogger(__name__)
+
+
+# Global instances
+connection_manager = ConnectionManager(
+    heartbeat_interval=settings.server.heartbeat_interval
+)
+agents: Dict[str, ReactAgent] = {}
+
+
+def load_system_prompt() -> str:
+    """Load system prompt from file or return default."""
+    try:
+        with open("config/prompts/system_prompt.txt", "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        return DEFAULT_SYSTEM_PROMPT
+
+
+DEFAULT_SYSTEM_PROMPT = """You are a helpful AI assistant with access to tools and skills.
+
+## How to Use Tools
+You have direct tools available that you can call when needed. Simply use them when appropriate.
+
+## How to Use Skills
+Skills are powerful capability modules with documentation. To use a skill:
+1. Call `list_skills()` to see what's available
+2. Call `read_skill("skill_name")` to read the SKILL.md documentation
+3. Use `execute_command("...")` to run skill commands as documented
+
+**Important**: ALWAYS read a skill's documentation before using it. The SKILL.md contains exact command formats and examples.
+
+## Guidelines
+- Think step-by-step about complex problems
+- Use tools/skills when they would help
+- If something fails, explain what happened and try alternatives
+- Be concise but thorough"""
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager."""
+    logger.info("Starting agent server...")
+    
+    # Initialize skill index
+    skill_index.set_base_path(settings.skills.base_path)
+    if settings.skills.auto_discover:
+        skill_index.discover()
+    
+    # Initialize skill command executor
+    command_executor = SkillCommandExecutor(
+        base_path=skill_index.base_path,
+        allowed_prefixes=settings.skills.allowed_commands,
+        timeout=settings.skills.command_timeout
+    )
+    core_tools.set_command_executor(command_executor)
+    
+    logger.info(f"Loaded {len(skill_index.list_skills())} skills")
+    logger.info(f"Loaded {len(tool_registry.list_names())} tools")
+    
+    yield
+    
+    logger.info("Shutting down...")
+
+
+app = FastAPI(
+    title="Autonomous Agent",
+    description="WebSocket-based conversational agent with tools and skills",
+    version="0.1.0",
+    lifespan=lifespan
+)
+
+# CORS for web clients
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def create_agent() -> ReactAgent:
+    """Create a new agent instance."""
+    llm = LLMFactory.from_config({
+        "provider": settings.llm.provider,
+        "model": settings.llm.model,
+        "api_key": settings.llm.anthropic_api_key,
+        "cache": {"enabled": settings.llm.cache.enabled},
+        "max_tokens": settings.llm.max_tokens,
+        "temperature": settings.llm.temperature,
+    })
+    
+    return ReactAgent(
+        llm=llm,
+        tool_registry=tool_registry,
+        skill_index=skill_index,
+        system_prompt=load_system_prompt(),
+        max_iterations=settings.agent.max_iterations
+    )
+
+
+@app.websocket("/chat")
+async def chat_websocket(websocket: WebSocket):
+    """Main WebSocket endpoint for chat."""
+    client_id = str(uuid.uuid4())
+    
+    await connection_manager.connect(websocket, client_id)
+    
+    # Create agent for this connection
+    agent = create_agent()
+    agents[client_id] = agent
+    
+    try:
+        # Send connection confirmation
+        await connection_manager.send_json(client_id, ServerMessage(
+            type="connected",
+            data={
+                "client_id": client_id,
+                "model": f"{settings.llm.provider}/{settings.llm.model}"
+            }
+        ).to_json_dict())
+        
+        while True:
+            raw_data = await websocket.receive_json()
+            
+            try:
+                message = ClientMessage(**raw_data)
+            except Exception as e:
+                await connection_manager.send_json(client_id, ServerMessage(
+                    type="error",
+                    content=f"Invalid message format: {e}"
+                ).to_json_dict())
+                continue
+            
+            # Handle different message types
+            if message.type == "ping":
+                await connection_manager.send_json(client_id, ServerMessage(
+                    type="pong"
+                ).to_json_dict())
+            
+            elif message.type == "reset":
+                agent.reset()
+                await connection_manager.send_json(client_id, ServerMessage(
+                    type="status",
+                    content="Conversation reset"
+                ).to_json_dict())
+            
+            elif message.type == "switch_model":
+                # Hot-swap model
+                if message.data and "provider" in message.data and "model" in message.data:
+                    try:
+                        new_llm = LLMFactory.create(
+                            provider=message.data["provider"],
+                            model=message.data["model"],
+                            api_key=message.data.get("api_key")
+                        )
+                        agent.update_llm(new_llm)
+                        await connection_manager.send_json(client_id, ServerMessage(
+                            type="model_switched",
+                            data={
+                                "provider": message.data["provider"],
+                                "model": message.data["model"]
+                            }
+                        ).to_json_dict())
+                    except Exception as e:
+                        await connection_manager.send_json(client_id, ServerMessage(
+                            type="error",
+                            content=f"Failed to switch model: {e}"
+                        ).to_json_dict())
+            
+            elif message.type == "chat" and message.content:
+                # Process chat message with streaming
+                try:
+                    async for event in agent.process_stream(message.content):
+                        await connection_manager.send_json(client_id, ServerMessage(
+                            type=event.type,
+                            content=event.data.get("content"),
+                            data={k: v for k, v in event.data.items() if k != "content"}
+                        ).to_json_dict())
+                except Exception as e:
+                    logger.exception(f"Agent processing error: {e}")
+                    await connection_manager.send_json(client_id, ServerMessage(
+                        type="error",
+                        content=f"Processing error: {str(e)}"
+                    ).to_json_dict())
+    
+    except WebSocketDisconnect:
+        logger.info(f"Client {client_id} disconnected normally")
+    except Exception as e:
+        logger.exception(f"WebSocket error for {client_id}: {e}")
+    finally:
+        connection_manager.disconnect(client_id)
+        agents.pop(client_id, None)
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "connections": connection_manager.get_connection_count(),
+        "skills": len(skill_index.list_skills()),
+        "tools": len(tool_registry.list_names())
+    }
+
+
+@app.get("/info")
+async def server_info():
+    """Server information endpoint."""
+    return {
+        "version": "0.1.0",
+        "llm": {
+            "provider": settings.llm.provider,
+            "model": settings.llm.model
+        },
+        "skills": [
+            {"name": s.name, "description": s.description}
+            for s in skill_index.list_skills()
+        ],
+        "tools": tool_registry.list_names()
+    }
+```
+
+### 10.4 Main Entry Point (src/agent/main.py)
+
+```python
+"""
+Application entry point.
+"""
+
+import uvicorn
+import logging
+from .transport.server import app
+from .config.settings import settings
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
+
+def main():
+    """Start the agent server."""
+    uvicorn.run(
+        "agent.transport.server:app",
+        host=settings.server.host,
+        port=settings.server.port,
+        reload=True,
+        log_level="info"
+    )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 11. System Prompt Design
+
+### config/prompts/system_prompt.txt
+
+```
+You are a helpful AI assistant with access to tools and skills that extend your capabilities.
+
+## Your Capabilities
+
+### Direct Tools
+You have tools you can call directly when needed. These are fast, single-operation functions.
+
+### Skills
+Skills are powerful capability modules with documentation. Each skill has:
+- A SKILL.md file with detailed documentation, command formats, and examples
+- Scripts that you execute via the `execute_command` tool
+
+**To use a skill:**
+1. Call `list_skills()` to see available skills
+2. Call `read_skill("skill_name")` to read the full SKILL.md documentation
+3. Use `execute_command("command here")` to run skill commands exactly as documented
+
+**IMPORTANT**: ALWAYS read a skill's SKILL.md documentation BEFORE attempting to use it. The documentation contains the exact command syntax, available operations, and examples you need. Never guess at skill command formats.
+
+## Guidelines
+
+1. **Think step-by-step** for complex problems
+2. **Use tools/skills** when they would genuinely help
+3. **Read skill documentation** before executing skill commands
+4. **Handle errors gracefully** - if something fails, explain what happened and try alternatives
+5. **Be concise but thorough** in your responses
+6. **Be honest** about what you can and cannot do
+
+## Error Handling
+
+- If a tool times out, acknowledge it and suggest alternatives
+- If a command fails, read the error and try to fix it
+- If you're stuck, explain the situation clearly to the user
+- Never pretend something succeeded when it failed
+
+Remember: Your goal is to be genuinely helpful while being honest about your limitations.
+```
+
+---
+
+## 12. Step-by-Step Implementation Order
+
+Execute these steps in sequence. Each step builds on the previous.
+
+### Phase 1: Foundation (Day 1)
+| Step | Task | Time Est. | Deliverable |
+|------|------|-----------|-------------|
+| 1.1 | Create project structure and pyproject.toml | 15 min | Project skeleton |
+| 1.2 | Implement configuration system (settings.py, config.yaml) | 30 min | Working config |
+| 1.3 | Set up logging | 15 min | Logging configured |
+
+### Phase 2: LLM Layer (Day 1)
+| Step | Task | Time Est. | Deliverable |
+|------|------|-----------|-------------|
+| 2.1 | Implement base.py (interfaces) | 30 min | LLM abstractions |
+| 2.2 | Implement anthropic.py adapter | 1 hr | Claude integration |
+| 2.3 | Implement factory.py | 20 min | LLM factory |
+| 2.4 | Test LLM layer independently | 30 min | Verified working |
+
+### Phase 3: Tool System (Day 2)
+| Step | Task | Time Est. | Deliverable |
+|------|------|-----------|-------------|
+| 3.1 | Implement schema.py (JSON Schema generation) | 45 min | Schema generator |
+| 3.2 | Implement registry.py | 45 min | Tool registry |
+| 3.3 | Implement executor.py | 1 hr | Tool executor |
+| 3.4 | Test tool system | 30 min | Verified working |
+
+### Phase 4: Skill System (Day 2)
+| Step | Task | Time Est. | Deliverable |
+|------|------|-----------|-------------|
+| 4.1 | Implement loader.py (SKILL.md parser) | 30 min | Skill loader |
+| 4.2 | Implement index.py | 30 min | Skill index |
+| 4.3 | Implement skills/executor.py (command runner) | 45 min | Command executor |
+| 4.4 | Implement core_tools.py (read_skill, execute_command) | 45 min | Built-in tools |
+| 4.5 | Copy calculator skill to skills/ directory | 10 min | Test skill |
+| 4.6 | Test skill system end-to-end | 30 min | Verified working |
+
+### Phase 5: Fault Tolerance (Day 3)
+| Step | Task | Time Est. | Deliverable |
+|------|------|-----------|-------------|
+| 5.1 | Implement circuit_breaker.py | 30 min | Circuit breaker |
+| 5.2 | Implement retry.py | 20 min | Retry utilities |
+| 5.3 | Integrate into executor | 30 min | Protected execution |
+
+### Phase 6: Core Agent (Day 3)
+| Step | Task | Time Est. | Deliverable |
+|------|------|-----------|-------------|
+| 6.1 | Implement memory.py | 30 min | Conversation memory |
+| 6.2 | Implement agent.py (ReAct loop) | 2 hr | Working agent |
+| 6.3 | Write system_prompt.txt | 30 min | System prompt |
+| 6.4 | Test agent with tools + skills | 1 hr | Verified working |
+
+### Phase 7: WebSocket Transport (Day 4)
+| Step | Task | Time Est. | Deliverable |
+|------|------|-----------|-------------|
+| 7.1 | Implement messages.py | 20 min | Message schemas |
+| 7.2 | Implement connection.py | 30 min | Connection manager |
+| 7.3 | Implement server.py | 1 hr | WebSocket server |
+| 7.4 | Implement main.py | 10 min | Entry point |
+| 7.5 | Integration testing | 1 hr | Full system test |
+
+### Phase 8: Polish (Day 4-5)
+| Step | Task | Time Est. | Deliverable |
+|------|------|-----------|-------------|
+| 8.1 | Add OpenAI adapter (optional) | 45 min | Multi-model support |
+| 8.2 | Write tests | 2 hr | Test coverage |
+| 8.3 | Documentation | 1 hr | README.md |
+| 8.4 | Performance tuning | 1 hr | Optimized system |
+
+**Total Estimated Time: 4-5 days**
+
+---
+
+## 13. Testing Strategy
+
+### 13.1 Unit Tests
+
+```python
+# tests/test_tools.py
+import pytest
+from agent.tools.registry import ToolRegistry, tool
+from agent.tools.schema import function_to_schema
+
+def test_tool_registration():
+    registry = ToolRegistry()
+    
+    @registry.tool(name="test_tool", description="A test tool")
+    def my_tool(x: int, y: str = "default") -> str:
+        return f"{x}-{y}"
+    
+    assert "test_tool" in registry.list_names()
+    tool = registry.get("test_tool")
+    assert tool.description == "A test tool"
+
+def test_schema_generation():
+    def calculate(a: int, b: int, operation: str = "add") -> int:
+        """
+        Perform calculation.
+        
+        Args:
+            a: First number
+            b: Second number
+            operation: The operation to perform
+        """
+        pass
+    
+    schema = function_to_schema(calculate)
+    assert schema.name == "calculate"
+    assert "a" in schema.parameters["required"]
+    assert "b" in schema.parameters["required"]
+    assert "operation" not in schema.parameters["required"]
+```
+
+```python
+# tests/test_skills.py
+import pytest
+from pathlib import Path
+from agent.skills.loader import SkillLoader
+from agent.skills.index import SkillIndex
+
+def test_skill_loading(tmp_path):
+    # Create test skill
+    skill_dir = tmp_path / "test_skill"
+    skill_dir.mkdir()
+    
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text("""---
+name: test_skill
+description: A test skill for testing
+---
+
+# Test Skill
+
+This is a test skill.
+""")
+    
+    skill = SkillLoader.load(skill_dir)
+    assert skill is not None
+    assert skill.name == "test_skill"
+    assert "test skill for testing" in skill.description
+```
+
+### 13.2 Integration Tests
+
+```python
+# tests/test_integration.py
+import pytest
+import asyncio
+from agent.core.agent import ReactAgent
+from agent.llm.anthropic import AnthropicLLM
+from agent.tools.registry import ToolRegistry
+from agent.skills.index import SkillIndex
+
+@pytest.mark.asyncio
+async def test_agent_tool_execution():
+    # Setup
+    registry = ToolRegistry()
+    
+    @registry.tool()
+    def add(a: int, b: int) -> int:
+        """Add two numbers."""
+        return a + b
+    
+    llm = AnthropicLLM(model="claude-sonnet-4-5-20250929")
+    skill_index = SkillIndex()
+    
+    agent = ReactAgent(
+        llm=llm,
+        tool_registry=registry,
+        skill_index=skill_index,
+        system_prompt="You are a helpful assistant with math tools.",
+        max_iterations=5
+    )
+    
+    response = await agent.process("What is 5 + 3?")
+    assert "8" in response.content
+    assert len(response.tool_calls_made) > 0
+```
+
+### 13.3 WebSocket Tests
+
+```python
+# tests/test_websocket.py
+import pytest
+from httpx import AsyncClient
+from agent.transport.server import app
+
+@pytest.mark.asyncio
+async def test_health_endpoint():
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["status"] == "healthy"
+```
+
+---
+
+---
+
+## 14. Demo Scenario: Success Criteria
+
+This section defines the **exact demo** that proves the implementation works. This is your success metric.
+
+### Demo Overview
+
+**Goal**: Run an agent that can:
+1. ✅ Have a normal conversation
+2. ✅ Call a direct **tool** (e.g., `get_current_time`)
+3. ✅ Use a **skill** by reading SKILL.md and executing commands (calculator)
+4. ✅ Combine multiple capabilities in one conversation
+5. ✅ Recover gracefully from errors
+
+### Demo Setup
+
+**1. Start the server:**
+```bash
+cd autonomous-agent
+python -m agent.main
+```
+
+**2. Connect via WebSocket client** (can use `websocat`, Python script, or web UI):
+```bash
+websocat ws://localhost:8000/chat
+```
+
+### Demo Script: The Complete Test Conversation
+
+Below is the exact conversation flow. The agent should handle all of these correctly.
+
+---
+
+#### **Test 1: Basic Conversation (No Tools/Skills)**
+
+**User:**
+```json
+{"type": "chat", "content": "Hello! What can you help me with?"}
+```
+
+**Expected Agent Response (streaming via WebSocket):**
+```
+Events received:
+  → {"type": "processing_start", ...}
+  → {"type": "iteration_start", "data": {"iteration": 1}}
+  → {"type": "text_delta", "content": "Hello"}
+  → {"type": "text_delta", "content": "!"}
+  → {"type": "text_delta", "content": " I"}
+  ... (more deltas)
+  → {"type": "complete", "data": {"content": "Hello! I can help you with various tasks. I have access to tools for getting the current time and weather, and I can perform mathematical calculations using the calculator skill. What would you like to do?", "iterations": 1}}
+```
+
+✅ **Success**: Agent responds conversationally, mentions its capabilities.
+
+---
+
+#### **Test 2: Direct Tool Call (get_current_time)**
+
+This tests the **Tool** primitive - direct function invocation.
+
+**User:**
+```json
+{"type": "chat", "content": "What time is it right now?"}
+```
+
+**Expected Flow:**
+```
+Events received:
+  → {"type": "processing_start", ...}
+  → {"type": "iteration_start", "data": {"iteration": 1}}
+  → {"type": "tool_start", "data": {"tool_name": "get_current_time"}}
+  → {"type": "tool_call_complete", "data": {"tool_name": "get_current_time", "tool_id": "toolu_xxx"}}
+  → {"type": "executing_tools", "data": {"count": 1}}
+  → {"type": "tool_result", "data": {"tool_name": "get_current_time", "success": true, "time_ms": 5}}
+  → {"type": "iteration_start", "data": {"iteration": 2}}
+  → {"type": "text_delta", "content": "The"}
+  → {"type": "text_delta", "content": " current"}
+  ... (more deltas)
+  → {"type": "complete", "data": {"content": "The current time is 2:34 PM on December 9, 2024.", "iterations": 2}}
+```
+
+✅ **Success**: Agent calls `get_current_time` tool, receives result, formulates response.
+
+---
+
+#### **Test 3: Skill Execution (Calculator - Basic Arithmetic)**
+
+This tests the **Skill** primitive - reading SKILL.md then executing commands.
+
+**User:**
+```json
+{"type": "chat", "content": "Can you calculate 1024 divided by 16?"}
+```
+
+**Expected Flow:**
+```
+Events received:
+  → {"type": "processing_start", ...}
+  → {"type": "iteration_start", "data": {"iteration": 1}}
+  → {"type": "text_delta", "content": "I'll"}  // Agent might think aloud briefly
+  → {"type": "tool_start", "data": {"tool_name": "read_skill"}}
+  → {"type": "tool_call_complete", "data": {"tool_name": "read_skill", "tool_id": "toolu_xxx"}}
+  → {"type": "executing_tools", "data": {"count": 1}}
+  → {"type": "tool_result", "data": {"tool_name": "read_skill", "success": true}}
+  
+  // Agent now has SKILL.md content, proceeds to execute
+  → {"type": "iteration_start", "data": {"iteration": 2}}
+  → {"type": "tool_start", "data": {"tool_name": "execute_command"}}
+  → {"type": "tool_call_complete", "data": {"tool_name": "execute_command", "tool_id": "toolu_yyy"}}
+  → {"type": "executing_tools", "data": {"count": 1}}
+  → {"type": "tool_result", "data": {"tool_name": "execute_command", "success": true}}
+  
+  // Agent interprets result and responds
+  → {"type": "iteration_start", "data": {"iteration": 3}}
+  → {"type": "text_delta", "content": "1024"}
+  → {"type": "text_delta", "content": " divided"}
+  ... (more deltas)
+  → {"type": "complete", "data": {"content": "1024 divided by 16 equals **64**.", "iterations": 3}}
+```
+
+**Behind the scenes - what the agent executed:**
+```bash
+python3 skills/calculator/scripts/calc.py calc divide 1024 16
+```
+
+**Skill output:**
+```json
+{"operation": "divide", "a": 1024.0, "b": 16.0, "result": 64.0}
+```
+
+✅ **Success**: Agent read calculator SKILL.md, understood command format, executed correctly, interpreted JSON result.
+
+---
+
+#### **Test 4: Skill Execution (Calculator - Complex Expression)**
+
+**User:**
+```json
+{"type": "chat", "content": "What is the square root of 144 plus 5 squared?"}
+```
+
+**Expected Agent Behavior:**
+
+The agent should:
+1. Read skill (or use cached knowledge from previous turn)
+2. Execute: `python3 skills/calculator/scripts/calc.py expr "sqrt(144) + pow(5, 2)"`
+3. Get result: `{"expression": "sqrt(144) + pow(5, 2)", "variables": {}, "result": 37.0}`
+4. Respond: "The square root of 144 is 12, and 5 squared is 25. Adding them together gives **37**."
+
+✅ **Success**: Agent uses the `expr` subcommand correctly for complex math.
+
+---
+
+#### **Test 5: Skill Execution (Calculator - Array Operations)**
+
+**User:**
+```json
+{"type": "chat", "content": "I have test scores: 85, 92, 78, 96, 88. What's the average and standard deviation?"}
+```
+
+**Expected Agent Behavior:**
+
+Agent executes two commands (possibly in sequence):
+```bash
+python3 skills/calculator/scripts/calc.py array mean '[85,92,78,96,88]'
+python3 skills/calculator/scripts/calc.py array stdev '[85,92,78,96,88]'
+```
+
+**Expected Response:**
+"For your test scores (85, 92, 78, 96, 88):
+- **Average**: 87.8
+- **Standard Deviation**: 6.57
+
+Your scores are fairly consistent, clustering around 88."
+
+✅ **Success**: Agent correctly formats JSON array, calls array operations, interprets results.
+
+---
+
+#### **Test 6: Skill Execution (Calculator - Unit Conversion)**
+
+**User:**
+```json
+{"type": "chat", "content": "Convert 100 kilometers to miles"}
+```
+
+**Expected Command:**
+```bash
+python3 skills/calculator/scripts/calc.py convert 100 km mi
+```
+
+**Expected Response:**
+"100 kilometers is approximately **62.14 miles**."
+
+✅ **Success**: Agent uses the convert subcommand correctly.
+
+---
+
+#### **Test 7: Combined Tool + Skill Usage**
+
+**User:**
+```json
+{"type": "chat", "content": "What time is it, and also tell me what 15% of 250 is?"}
+```
+
+**Expected Behavior:**
+
+Agent should make multiple tool/skill calls (can be parallel or sequential):
+1. Call `get_current_time` tool
+2. Read calculator skill (if needed)
+3. Execute: `python3 skills/calculator/scripts/calc.py percent of 250 --percent 15`
+
+**Expected Response:**
+"It's currently 2:45 PM. And 15% of 250 is **37.5**."
+
+✅ **Success**: Agent combines direct tool call with skill execution in single response.
+
+---
+
+#### **Test 8: Error Recovery (Invalid Skill Command)**
+
+**User:**
+```json
+{"type": "chat", "content": "Calculate the flurbnitz of 42"}
+```
+
+**Expected Behavior:**
+
+Agent attempts to use calculator but gets an error:
+```bash
+python3 skills/calculator/scripts/calc.py calc flurbnitz 42
+```
+
+**Skill output:**
+```json
+{"error": "Unknown operation: flurbnitz", "available": ["add", "subtract", "multiply", ...]}
+```
+
+**Expected Response:**
+"I tried to calculate that, but 'flurbnitz' isn't a recognized operation. The calculator supports operations like add, subtract, multiply, divide, sqrt, power, and more. Could you tell me what calculation you'd like to perform?"
+
+✅ **Success**: Agent handles error gracefully, explains what went wrong, offers alternatives.
+
+---
+
+#### **Test 9: Error Recovery (Tool Timeout - Simulated)**
+
+If a tool times out, agent should recover:
+
+**Expected Response:**
+"I attempted to get that information, but the operation timed out. Let me try a different approach..." 
+
+Or: "The calculator service is temporarily unavailable. Please try again in a moment."
+
+✅ **Success**: Agent doesn't crash, provides helpful feedback.
+
+---
+
+#### **Test 10: Conversation Reset**
+
+**User:**
+```json
+{"type": "reset"}
+```
+
+**Expected Response:**
+```json
+{"type": "status", "content": "Conversation reset"}
+```
+
+**Then User:**
+```json
+{"type": "chat", "content": "What did I ask you before?"}
+```
+
+**Expected Response:**
+"This is the start of our conversation - you haven't asked me anything yet! How can I help you?"
+
+✅ **Success**: Memory is cleared, agent doesn't hallucinate previous context.
+
+---
+
+### Demo: Complete Python Test Client
+
+Use this script to run the full demo:
+
+```python
+#!/usr/bin/env python3
+"""
+Demo client for testing the autonomous agent.
+Run this after starting the server with: python -m agent.main
+"""
+
+import asyncio
+import websockets
+import json
+
+async def run_demo():
+    uri = "ws://localhost:8000/chat"
+    
+    async with websockets.connect(uri) as ws:
+        # Wait for connection confirmation
+        response = await ws.recv()
+        print(f"Connected: {response}\n")
+        
+        # Demo conversations
+        tests = [
+            ("Basic chat", "Hello! What can you help me with?"),
+            ("Direct tool", "What time is it right now?"),
+            ("Skill: basic math", "Calculate 1024 divided by 16"),
+            ("Skill: expression", "What is sqrt(144) + 5^2?"),
+            ("Skill: array", "Find the average of [85, 92, 78, 96, 88]"),
+            ("Skill: convert", "Convert 100 km to miles"),
+            ("Combined", "What time is it, and what's 15% of 250?"),
+            ("Error handling", "Calculate the flurbnitz of 42"),
+        ]
+        
+        for test_name, message in tests:
+            print(f"\n{'='*60}")
+            print(f"TEST: {test_name}")
+            print(f"USER: {message}")
+            print(f"{'='*60}")
+            
+            # Send message
+            await ws.send(json.dumps({"type": "chat", "content": message}))
+            
+            # Collect streaming response
+            full_response = ""
+            while True:
+                response = await ws.recv()
+                data = json.loads(response)
+                
+                if data["type"] == "text_delta":
+                    print(data.get("content", ""), end="", flush=True)
+                    full_response += data.get("content", "")
+                elif data["type"] == "tool_start":
+                    print(f"\n  [Calling tool: {data['data']['tool_name']}]")
+                elif data["type"] == "tool_result":
+                    status = "✓" if data["data"]["success"] else "✗"
+                    print(f"  [{status} Tool result: {data['data']['tool_name']}]")
+                elif data["type"] == "complete":
+                    print(f"\n\n✅ Completed in {data['data'].get('iterations', '?')} iterations")
+                    break
+                elif data["type"] == "error":
+                    print(f"\n❌ Error: {data.get('content')}")
+                    break
+            
+            # Small delay between tests
+            await asyncio.sleep(1)
+        
+        # Test reset
+        print(f"\n{'='*60}")
+        print("TEST: Conversation Reset")
+        print(f"{'='*60}")
+        await ws.send(json.dumps({"type": "reset"}))
+        response = await ws.recv()
+        print(f"Reset response: {response}")
+        
+        print("\n\n🎉 DEMO COMPLETE!")
+
+if __name__ == "__main__":
+    asyncio.run(run_demo())
+```
+
+---
+
+### Success Metrics Summary
+
+| Test | What It Proves | Pass Criteria |
+|------|----------------|---------------|
+| Test 1 | Basic conversation | Coherent response without tools |
+| Test 2 | Direct tool execution | Tool called, result interpreted |
+| Test 3 | Skill reading + execution | SKILL.md read, command executed correctly |
+| Test 4 | Complex skill usage | Expression evaluation works |
+| Test 5 | Array operations | JSON array formatted correctly |
+| Test 6 | Unit conversion | Subcommand routing works |
+| Test 7 | Combined capabilities | Multiple tools/skills in one turn |
+| Test 8 | Error recovery | Graceful handling of invalid input |
+| Test 9 | Timeout handling | No crash on slow operations |
+| Test 10 | State management | Reset clears conversation |
+
+### Minimum Viable Demo (Quick Test)
+
+If you want the **simplest possible demo** to verify everything works:
+
+```bash
+# Terminal 1: Start server
+python -m agent.main
+
+# Terminal 2: Quick test with websocat
+echo '{"type":"chat","content":"What is 25 * 4?"}' | websocat ws://localhost:8000/chat
+```
+
+**Expected**: You should see streaming events, including `read_skill` → `execute_command` → final answer "**100**".
+
+If that works, the entire system is functional. 🎉
+
+---
+
+## Summary
+
+This implementation plan provides:
+
+1. **Complete separation of Tools and Skills** as distinct primitives
+2. **Generic architecture** - nothing specific to any particular tool or skill
+3. **Low latency** via streaming, prompt caching, and parallel execution
+4. **Fault tolerance** via circuit breakers and retry logic
+5. **Easy model switching** via the LLM abstraction layer
+6. **WebSocket streaming** for real-time chat
+7. **Security controls** for command execution
+
+The agent follows the ReAct pattern: it reasons about what to do, takes actions (tool calls or skill commands), observes results, and iterates until complete.
+
+**Key Integration Points:**
+- Tools are called directly by the LLM via `tool_use`
+- Skills are accessed via the `read_skill` and `execute_command` built-in tools
+- Both systems share the same executor infrastructure for fault tolerance
+- The system prompt instructs the agent on how to use both primitives
+
+The coding agent implementing this plan should follow the step-by-step order and test each component before moving to the next phase.
