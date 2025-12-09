@@ -194,13 +194,18 @@ The following skills are available. Use `read_skill` to get documentation before
                         )
                     
                     elif chunk.type == "tool_use_start":
+                        logger.info(f"Tool starting: {chunk.tool_call.name} (id: {chunk.tool_call.id})")
                         yield AgentEvent(
                             type="tool_start",
-                            data={"tool_name": chunk.tool_call.name}
+                            data={
+                                "tool_name": chunk.tool_call.name,
+                                "tool_id": chunk.tool_call.id
+                            }
                         )
                     
                     elif chunk.type == "tool_use_complete":
                         tool_calls.append(chunk.tool_call)
+                        logger.info(f"Tool call parsed: {chunk.tool_call.name} (id: {chunk.tool_call.id})")
                         yield AgentEvent(
                             type="tool_call_complete",
                             data={
@@ -252,9 +257,12 @@ The following skills are available. Use `read_skill` to get documentation before
                 for tc in tool_calls
             ]
             
+            logger.info(f"Executing {len(tool_call_dicts)} tools in parallel")
             results = await self.executor.execute_parallel(tool_call_dicts)
             
             for result in results:
+                logger.info(f"Tool result: {result.tool_name} - {'success' if result.success else 'failed'} ({result.execution_time_ms:.0f}ms)")
+                
                 self.memory.add_tool_result(
                     tool_call_id=result.tool_call_id,
                     result=result.to_message_content()
@@ -263,6 +271,7 @@ The following skills are available. Use `read_skill` to get documentation before
                 yield AgentEvent(
                     type="tool_result",
                     data={
+                        "tool_id": result.tool_call_id,
                         "tool_name": result.tool_name,
                         "success": result.success,
                         "time_ms": result.execution_time_ms

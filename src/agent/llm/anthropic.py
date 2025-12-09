@@ -164,6 +164,8 @@ class AnthropicLLM(BaseLLM):
         **kwargs
     ) -> AsyncIterator[StreamChunk]:
         """Stream completion with real-time token delivery."""
+        start_time = time.time()
+        
         request = {
             "model": self._model,
             "max_tokens": kwargs.get("max_tokens", self._max_tokens),
@@ -176,6 +178,20 @@ class AnthropicLLM(BaseLLM):
         
         if tools:
             request["tools"] = self._convert_tools(tools)
+        
+        # Trace the request
+        trace_id = tracer.trace_request(
+            messages=[m.to_dict() for m in messages],
+            system_prompt=system_prompt,
+            tools=tools,
+            model=self._model,
+            **kwargs
+        )
+        
+        logger.info(f"[{trace_id}] Starting LLM stream request with {len(messages)} messages")
+        
+        collected_content = ""
+        collected_tool_calls = []
         
         try:
             async with self._client.messages.stream(**request) as stream:
@@ -192,6 +208,7 @@ class AnthropicLLM(BaseLLM):
                                     "name": block.name,
                                 }
                                 tool_input_json = ""
+                                logger.info(f"[{trace_id}] Tool call started: {block.name}")
                                 yield StreamChunk(
                                     type="tool_use_start",
                                     tool_call=ToolCall(
@@ -204,6 +221,7 @@ class AnthropicLLM(BaseLLM):
                     elif event.type == "content_block_delta":
                         delta = event.delta
                         if hasattr(delta, 'text'):
+                            collected_content += delta.text
                             yield StreamChunk(type="text_delta", content=delta.text)
                         elif hasattr(delta, 'partial_json'):
                             tool_input_json += delta.partial_json
@@ -216,20 +234,39 @@ class AnthropicLLM(BaseLLM):
                             except json.JSONDecodeError:
                                 parsed_input = {"raw": tool_input_json}
                             
+                            tool_call = ToolCall(
+                                id=current_tool["id"],
+                                name=current_tool["name"],
+                                input=parsed_input
+                            )
+                            collected_tool_calls.append(tool_call)
+                            logger.info(f"[{trace_id}] Tool call complete: {current_tool['name']}")
+                            
                             yield StreamChunk(
                                 type="tool_use_complete",
-                                tool_call=ToolCall(
-                                    id=current_tool["id"],
-                                    name=current_tool["name"],
-                                    input=parsed_input
-                                )
+                                tool_call=tool_call
                             )
                             current_tool = None
                             tool_input_json = ""
                     
                     elif event.type == "message_stop":
+                        duration_ms = (time.time() - start_time) * 1000
+                        logger.info(f"[{trace_id}] Stream complete in {duration_ms:.0f}ms")
+                        
+                        # Trace the response
+                        tracer.trace_response(
+                            trace_id=trace_id,
+                            response={
+                                "content": collected_content,
+                                "tool_calls": [{"id": tc.id, "name": tc.name, "input": tc.input} for tc in collected_tool_calls]
+                            },
+                            duration_ms=duration_ms
+                        )
+                        
                         yield StreamChunk(type="done")
         
         except Exception as e:
-            logger.error(f"Streaming error: {e}")
+            duration_ms = (time.time() - start_time) * 1000
+            logger.error(f"[{trace_id}] Streaming error after {duration_ms:.0f}ms: {e}")
+            tracer.trace_response(trace_id=trace_id, response=None, duration_ms=duration_ms, error=str(e))
             yield StreamChunk(type="error", error=str(e))

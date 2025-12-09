@@ -1,5 +1,6 @@
 from .base import BaseLLM, LLMMessage, LLMResponse, StreamChunk, ToolCall, StopReason
 from .factory import LLMFactory
+from .tracer import LLMTracer, tracer
 
 __all__ = [
     "BaseLLM",
@@ -8,5 +9,7 @@ __all__ = [
     "StreamChunk",
     "ToolCall",
     "StopReason",
-    "LLMFactory"
+    "LLMFactory",
+    "LLMTracer",
+    "tracer"
 ]

@@ -13,6 +13,8 @@ class AgentChat {
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 5;
         this.reconnectDelay = 1000;
+        this.pendingTools = new Map(); // Track tool_id -> element for proper updates
+        this.toolCounter = 0; // Unique ID for each tool indicator
         
         // DOM elements
         this.messagesContainer = document.getElementById('messagesContainer');
@@ -118,19 +120,22 @@ class AgentChat {
                 break;
                 
             case 'tool_start':
-                this.showToolIndicator(message.data?.tool_name, 'running');
+                this.showToolIndicator(message.data?.tool_name, 'running', message.data?.tool_id);
                 break;
                 
             case 'tool_call_complete':
-                // Tool call parsed, waiting for execution
+                // Tool call parsed - update to show it's about to execute
+                this.updateToolStatus(message.data?.tool_id, message.data?.tool_name, 'executing');
                 break;
                 
             case 'executing_tools':
-                // About to execute tools
+                // About to execute tools - update any pending
+                console.log(`Executing ${message.data?.count} tools`);
                 break;
                 
             case 'tool_result':
-                this.updateToolIndicator(
+                this.updateToolStatus(
+                    message.data?.tool_id,
                     message.data?.tool_name,
                     message.data?.success ? 'success' : 'error',
                     message.data?.time_ms
@@ -140,6 +145,7 @@ class AgentChat {
             case 'complete':
                 this.isProcessing = false;
                 this.hideProcessingIndicator();
+                this.finalizePendingTools(); // Mark any remaining tools as done
                 this.finalizeAssistantMessage();
                 this.updateInputState();
                 break;
@@ -275,35 +281,90 @@ class AgentChat {
         this.currentAssistantMessage = null;
     }
     
-    showToolIndicator(toolName, status) {
+    showToolIndicator(toolName, status, toolId = null) {
         if (!this.currentAssistantMessage) return;
+        
+        this.toolCounter++;
+        const uniqueId = toolId || `tool_${this.toolCounter}`;
         
         const toolsEl = this.currentAssistantMessage.querySelector('.tool-indicators');
         const toolEl = document.createElement('div');
         toolEl.className = 'tool-indicator';
-        toolEl.dataset.tool = toolName;
+        toolEl.dataset.toolId = uniqueId;
+        toolEl.dataset.toolName = toolName;
+        toolEl.dataset.status = 'running';
         toolEl.innerHTML = `
             <div class="tool-icon">⚙️</div>
             <span class="tool-name">${toolName}</span>
-            <span class="tool-status">${status === 'running' ? '⏳ Running...' : status}</span>
+            <span class="tool-status">⏳ Running...</span>
         `;
         toolsEl.appendChild(toolEl);
+        
+        // Track pending tool
+        this.pendingTools.set(uniqueId, { element: toolEl, name: toolName });
+        
         this.scrollToBottom();
     }
     
-    updateToolIndicator(toolName, status, timeMs) {
+    updateToolStatus(toolId, toolName, status, timeMs = null) {
         if (!this.currentAssistantMessage) return;
         
-        const toolEl = this.currentAssistantMessage.querySelector(`.tool-indicator[data-tool="${toolName}"]`);
-        if (toolEl) {
-            const statusEl = toolEl.querySelector('.tool-status');
-            statusEl.className = `tool-status ${status}`;
-            if (status === 'success') {
-                statusEl.textContent = `✓ ${timeMs ? Math.round(timeMs) + 'ms' : 'Done'}`;
-            } else {
-                statusEl.textContent = '✗ Failed';
+        let toolEl = null;
+        
+        // Try to find by ID first
+        if (toolId) {
+            toolEl = this.currentAssistantMessage.querySelector(`.tool-indicator[data-tool-id="${toolId}"]`);
+        }
+        
+        // Fallback: find first matching tool name that's still running
+        if (!toolEl && toolName) {
+            const allTools = this.currentAssistantMessage.querySelectorAll(`.tool-indicator[data-tool-name="${toolName}"]`);
+            for (const t of allTools) {
+                if (t.dataset.status === 'running' || t.dataset.status === 'executing') {
+                    toolEl = t;
+                    break;
+                }
             }
         }
+        
+        if (toolEl) {
+            const statusEl = toolEl.querySelector('.tool-status');
+            toolEl.dataset.status = status;
+            
+            if (status === 'executing') {
+                statusEl.textContent = '🔄 Executing...';
+                statusEl.className = 'tool-status';
+            } else if (status === 'success') {
+                statusEl.textContent = `✓ ${timeMs ? Math.round(timeMs) + 'ms' : 'Done'}`;
+                statusEl.className = 'tool-status success';
+                // Remove from pending
+                if (toolEl.dataset.toolId) {
+                    this.pendingTools.delete(toolEl.dataset.toolId);
+                }
+            } else if (status === 'error') {
+                statusEl.textContent = '✗ Failed';
+                statusEl.className = 'tool-status error';
+                // Remove from pending
+                if (toolEl.dataset.toolId) {
+                    this.pendingTools.delete(toolEl.dataset.toolId);
+                }
+            }
+        }
+    }
+    
+    finalizePendingTools() {
+        // Mark any remaining "running" or "executing" tools as complete
+        if (!this.currentAssistantMessage) return;
+        
+        const pendingTools = this.currentAssistantMessage.querySelectorAll('.tool-indicator[data-status="running"], .tool-indicator[data-status="executing"]');
+        for (const toolEl of pendingTools) {
+            const statusEl = toolEl.querySelector('.tool-status');
+            statusEl.textContent = '✓ Done';
+            statusEl.className = 'tool-status success';
+            toolEl.dataset.status = 'success';
+        }
+        
+        this.pendingTools.clear();
     }
     
     showIterationIndicator(iteration) {
